@@ -1,11 +1,9 @@
 {
-	"id": "sample-plugin",
-	"name": "Sample Plugin",
+	"id": "obsidian-telegram-bot-plugin",
+	"name": "Telegram Bot Plugin",
 	"version": "1.0.0",
 	"minAppVersion": "0.15.0",
-	"description": "Demonstrates some of the capabilities of the Obsidian API.",
-	"author": "Obsidian",
-	"authorUrl": "https://obsidian.md",
-	"fundingUrl": "https://obsidian.md/pricing",
+	"description": "This plugin provides a unified API that allows other Obsidian plugins to communicate through a single Telegram bot.",
+	"author": "Petrov Ivan",
 	"isDesktopOnly": false
 }
