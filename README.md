@@ -35,7 +35,7 @@ Integrate Telegram capabilities into your plugin using our API:
 
 ```typescript
 // Get API instance
-const telegramAPI = app.plugins.plugins['telegram-bot']?.getAPIv1();
+const telegramAPI = app.plugins.plugins['obsidian-telegram-bot-plugin']?.getAPIv1();
 
 if (telegramAPI) {
   // Register command handler
