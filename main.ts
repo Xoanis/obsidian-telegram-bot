@@ -175,7 +175,7 @@ class TelegramBotAdapter implements ITelegramBotPluginAPIv1 {
 					const reply = await element.handler(processed_before);
 					processed_before = processed_before || reply.processed;
 					if (reply.answer) {
-						ctx.reply(`*${element.unit}:*\n${this.esc(reply.answer)}`, {
+						ctx.reply(`*${this.esc(element.unit)}:*\n${this.esc(reply.answer)}`, {
 							parse_mode: "MarkdownV2"
 						});
 					}					
@@ -195,7 +195,7 @@ class TelegramBotAdapter implements ITelegramBotPluginAPIv1 {
 					const reply = await element.handler(obsidian_file, processed_before, caption);
 					processed_before = processed_before || reply.processed;
 					if (reply.answer) {
-						ctx.reply(`*${element.unit}:*\n${self.esc(reply.answer)}`, {
+						ctx.reply(`*${self.esc(element.unit)}:*\n${self.esc(reply.answer)}`, {
 							parse_mode: "MarkdownV2"
 						});
 					}
@@ -280,7 +280,7 @@ class TelegramBotAdapter implements ITelegramBotPluginAPIv1 {
 					const reply = await element.handler(text, processed_before);
 					processed_before = processed_before || reply.processed;
 					if (reply.answer) {
-						ctx.reply(`*${element.unit}:*\n${this.esc(reply.answer)}`, {
+						ctx.reply(`*${this.esc(element.unit)}:*\n${this.esc(reply.answer)}`, {
 							parse_mode: "MarkdownV2"
 						});
 					}					
@@ -385,15 +385,7 @@ export default class TelegramBotPlugin extends Plugin {
 			throw new TypeError('this.app.vault.adapter should be instanceof FileSystemAdapter!');
 		}
 
-		console.log(adapter.getBasePath())
-
 		this._api = new TelegramBotAdapter(this.app, this._bot, this.settings.chatId, adapter.getBasePath(), this.settings.downloadPath);
-
-		this.registerEvent(this.app.vault.on('create', (file) => {
-			console.log('a new file has entered the arena')
-			console.log(file);
-		}));
-
 		this._bot.start();
 	}
 
