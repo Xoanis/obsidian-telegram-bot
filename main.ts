@@ -88,7 +88,7 @@ type HandlerResult = {
 	processed: boolean;
 	answer: Reply;
 };
-type CommandHandler = (processed_before: boolean) => Promise<HandlerResult>;
+type CommandHandler = (args: string, processed_before: boolean) => Promise<HandlerResult>;
 type TextHandler = (text: string, processed_before: boolean) => Promise<HandlerResult>;
 type FileHandler = (file: TFile, processed_before: boolean, caption?: string) => Promise<HandlerResult>;
 
@@ -113,7 +113,7 @@ class TelegramBotAdapter implements ITelegramBotPluginAPIv1 {
 	private _file_handlers: Map<string, { handler: FileHandler, unit: string}[]>;
 
 	private esc(text: string): string {
-		return text.replace(/[_*[\]()~`>#+\-=|{}.!]/g, '\\$&');
+		return text.replace(/[_[\]()~`>#+\-=|{}.!]/g, '\\$&');
 	}
 
 	private getFileMimeType(msg: Message): string | undefined {
@@ -134,6 +134,30 @@ class TelegramBotAdapter implements ITelegramBotPluginAPIv1 {
 		} else {
 			return undefined;
 		}		
+	}
+
+	private mimeTypeMatches(pattern: string, mimeType: string): boolean {
+		if (pattern === mimeType) {
+			return true;
+		}
+
+		const [patternType, patternSubType] = pattern.split('/');
+		const [type, subType] = mimeType.split('/');
+
+		if (!patternType || !patternSubType || !type || !subType) {
+			return false;
+		}
+
+		// Support both "type/*" and "*/*" wildcard patterns.
+		if (patternType === '*' && patternSubType === '*') {
+			return true;
+		}
+
+		if (patternType === type && patternSubType === '*') {
+			return true;
+		}
+
+		return false;
 	}
 
 	private isGrammyFile(file: any): file is GrammyFile {
@@ -157,8 +181,10 @@ class TelegramBotAdapter implements ITelegramBotPluginAPIv1 {
 				if (String(ctx.chatId) !== this._chat_id) {
 					return;
 				}
-				const cmd = ctx.message?.text?.slice(1);
-				console.log("TelegramBotAdapter: cmd=",cmd)
+				const text = ctx.message?.text ?? "";
+				const [cmd, ...cmdArgs] = text.slice(1).trim().split(/\s+/);
+				const args = cmdArgs.join(" ");
+				console.log("TelegramBotAdapter: cmd=", cmd, "args=", args);
 				if (!cmd) {
 					console.error("No cmd")
 					return;
@@ -172,30 +198,30 @@ class TelegramBotAdapter implements ITelegramBotPluginAPIv1 {
 				let processed_before = false;
 				for (let i = 0; i < items.length; i++) {
 					const element = items[i];
-					const reply = await element.handler(processed_before);
+					const reply: HandlerResult = await element.handler(args, processed_before);
 					processed_before = processed_before || reply.processed;
 					if (reply.answer) {
 						ctx.reply(`*${this.esc(element.unit)}:*\n${this.esc(reply.answer)}`, {
 							parse_mode: "MarkdownV2"
 						});
-					}					
+					}
 				}
 
 			} catch (error) {
 				console.error(`Unexpected error: ${error}`)
-    			await ctx.reply('❌ Internal error');
+				await ctx.reply('❌ Internal error');
 			}
 		});
 
 		this._bot.on("message:file", async (ctx: Context) => {
 
-			async function handle(self: TelegramBotAdapter, specific_handlers: { handler: FileHandler; unit: string; }[], obsidian_file: TFile, caption: string | undefined, processed_before: boolean) {
+			async function handle(self: TelegramBotAdapter, specific_handlers: { handler: FileHandler; unit: string }[], obsidian_file: TFile, caption: string | undefined, processed_before: boolean) {
 				for (let i = 0; i < specific_handlers.length; i++) {
 					const element = specific_handlers[i];
 					const reply = await element.handler(obsidian_file, processed_before, caption);
 					processed_before = processed_before || reply.processed;
 					if (reply.answer) {
-						ctx.reply(`*${self.esc(element.unit)}:*\n${self.esc(reply.answer)}`, {
+						ctx.reply(`*${self.esc(element.unit)}:*\n${this.esc(reply.answer)}`, {
 							parse_mode: "MarkdownV2"
 						});
 					}
@@ -221,10 +247,20 @@ class TelegramBotAdapter implements ITelegramBotPluginAPIv1 {
 					return;
 				}
 
-				const specific_handlers = this._file_handlers.get(mime_type);
+				const exact_handlers = this._file_handlers.get(mime_type);
 				const all_files_handlers = this._file_handlers.get('');
+				const wildcard_handlers: { handler: FileHandler; unit: string }[] = [];
 
-				if (!specific_handlers && !all_files_handlers) {
+				for (const [pattern, handlers] of this._file_handlers.entries()) {
+					if (!pattern || pattern === mime_type) {
+						continue;
+					}
+					if (this.mimeTypeMatches(pattern, mime_type)) {
+						wildcard_handlers.push(...handlers);
+					}
+				}
+
+				if (!exact_handlers && wildcard_handlers.length === 0 && !all_files_handlers) {
 					console.log(`There are no handlers for file with type ${mime_type}`);
 					return;
 				}
@@ -249,8 +285,12 @@ class TelegramBotAdapter implements ITelegramBotPluginAPIv1 {
 				
 				let processed_before = false;
 
-				if (specific_handlers) {
-					processed_before = await handle(this, specific_handlers, obsidian_file, caption, processed_before);
+				if (exact_handlers) {
+					processed_before = await handle(this, exact_handlers, obsidian_file, caption, processed_before);
+				}
+
+				if (wildcard_handlers.length > 0) {
+					processed_before = await handle(this, wildcard_handlers, obsidian_file, caption, processed_before);
 				}
 
 				if (all_files_handlers) {
@@ -277,7 +317,7 @@ class TelegramBotAdapter implements ITelegramBotPluginAPIv1 {
 				let processed_before = false;
 				for (let i = 0; i < this._text_handlers.length; i++) {
 					const element = this._text_handlers[i];
-					const reply = await element.handler(text, processed_before);
+					const reply: HandlerResult = await element.handler(text, processed_before);
 					processed_before = processed_before || reply.processed;
 					if (reply.answer) {
 						ctx.reply(`*${this.esc(element.unit)}:*\n${this.esc(reply.answer)}`, {
