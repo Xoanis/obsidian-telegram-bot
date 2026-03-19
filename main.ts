@@ -5,6 +5,7 @@ import { type FileFlavor, hydrateFiles } from "@grammyjs/files";
 
 import * as path from 'path';
 import * as fs from 'fs';
+import { ITelegramBotPluginAPIv1, CommandHandler, HandlerResult, TextHandler, FileHandler } from './telegram_plugin_api';
 
 const moment = window.moment;
 
@@ -82,25 +83,6 @@ const DEFAULT_SETTINGS: TelegramBotPluginSettings = {
 	chatId: '',
 	downloadPath: '',
 }
-
-type Reply = string | null;
-type HandlerResult = {
-	processed: boolean;
-	answer: Reply;
-};
-type CommandHandler = (args: string, processed_before: boolean) => Promise<HandlerResult>;
-type TextHandler = (text: string, processed_before: boolean) => Promise<HandlerResult>;
-type FileHandler = (file: TFile, processed_before: boolean, caption?: string) => Promise<HandlerResult>;
-
-interface ITelegramBotPluginAPIv1 {
-	addCommandHandler(cmd: string, handler: CommandHandler, unit_name: string): void;
-	addTextHandler(handler: TextHandler, unit_name: string): void;
-	addFileHandler(handler: FileHandler, unit_name: string, mime_type?:string): void;
-
-	sendMessage(text: string): Promise<void>;
-	
-}
- 
 
 class TelegramBotAdapter implements ITelegramBotPluginAPIv1 {
 	private _app: App;
@@ -198,6 +180,7 @@ class TelegramBotAdapter implements ITelegramBotPluginAPIv1 {
 				let processed_before = false;
 				for (let i = 0; i < items.length; i++) {
 					const element = items[i];
+					console.log(`Executing handler for command ${cmd} from unit ${element.unit}`)
 					const reply: HandlerResult = await element.handler(args, processed_before);
 					processed_before = processed_before || reply.processed;
 					if (reply.answer) {
@@ -205,6 +188,7 @@ class TelegramBotAdapter implements ITelegramBotPluginAPIv1 {
 							parse_mode: "MarkdownV2"
 						});
 					}
+					console.log(`Finished handler for command ${cmd} from unit ${element.unit}, processed_before=${processed_before}`)
 				}
 
 			} catch (error) {
@@ -221,7 +205,7 @@ class TelegramBotAdapter implements ITelegramBotPluginAPIv1 {
 					const reply = await element.handler(obsidian_file, processed_before, caption);
 					processed_before = processed_before || reply.processed;
 					if (reply.answer) {
-						ctx.reply(`*${self.esc(element.unit)}:*\n${this.esc(reply.answer)}`, {
+						ctx.reply(`*${self.esc(element.unit)}:*\n${self.esc(reply.answer)}`, {
 							parse_mode: "MarkdownV2"
 						});
 					}
@@ -365,6 +349,17 @@ class TelegramBotAdapter implements ITelegramBotPluginAPIv1 {
 		await this._bot.api.sendMessage(this._chat_id, this.esc(text), {
 			parse_mode: 'MarkdownV2'			
 		});
+	}
+
+	disposeHandlersForUnit(unit_name: string): void {
+		console.log(`Disposing handlers for unit ${unit_name}`)
+		for (const [cmd, handlers] of this._command_handlers.entries()) {
+			this._command_handlers.set(cmd, handlers.filter(h => h.unit !== unit_name));
+		}
+		this._text_handlers = this._text_handlers.filter(h => h.unit !== unit_name);
+		for (const [mime, handlers] of this._file_handlers.entries()) {
+			this._file_handlers.set(mime, handlers.filter(h => h.unit !== unit_name));
+		}
 	}
 } 
 
