@@ -1,11 +1,23 @@
-import { App, FileSystemAdapter, Notice, Plugin, PluginSettingTab, Setting, TFile } from 'obsidian';
+import { App, FileSystemAdapter, Notice, Plugin, PluginSettingTab, Setting, TFile, normalizePath } from 'obsidian';
 import { Bot, type Context, InlineKeyboard, GrammyError, HttpError } from "grammy";
 import { Message, type File } from 'grammy/types';
 import { type FileFlavor, hydrateFiles } from "@grammyjs/files";
 
 import * as path from 'path';
 import * as fs from 'fs';
-import { ITelegramBotPluginAPIv1, CommandHandler, HandlerResult, TextHandler, FileHandler } from './telegram_plugin_api';
+import {
+	ITelegramBotPluginAPIv1,
+	ITelegramBotPluginAPIv2,
+	CommandHandler,
+	HandlerResult,
+	TextHandler,
+	FileHandler,
+	TelegramMessageContext,
+	TelegramMessageHandler,
+	TelegramMessageKind,
+	TelegramFileDescriptor,
+	SaveTelegramFileOptions,
+} from './telegram_plugin_api';
 
 const moment = window.moment;
 
@@ -78,21 +90,47 @@ interface TelegramBotPluginSettings {
 	downloadPath: string;
 }
 
+interface LegacyCommandEnvelope {
+	type: 'command';
+	command: string;
+	args: string;
+}
+
+interface LegacyTextEnvelope {
+	type: 'text';
+	text: string;
+}
+
+interface LegacyFileEnvelope {
+	type: 'file';
+	mimeType: string;
+	caption?: string;
+	getFile: () => Promise<TFile>;
+}
+
+type LegacyEnvelope = LegacyCommandEnvelope | LegacyTextEnvelope | LegacyFileEnvelope;
+
+interface TelegramEventEnvelope {
+	message: TelegramMessageContext;
+	legacy?: LegacyEnvelope;
+}
+
 const DEFAULT_SETTINGS: TelegramBotPluginSettings = {
 	botToken: '',
 	chatId: '',
 	downloadPath: '',
 }
 
-class TelegramBotAdapter implements ITelegramBotPluginAPIv1 {
+class TelegramBotAdapter implements ITelegramBotPluginAPIv1, ITelegramBotPluginAPIv2 {
 	private _app: App;
 	private _bot: Bot;
-	private readonly _chat_id: string;
 	private readonly _vault_path: string;
 	private readonly _download_path: string;
+	private readonly _get_chat_id: () => string;
 	private _command_handlers: Map<string,{ handler: CommandHandler, unit: string }[]>;
 	private _text_handlers: { handler: TextHandler, unit: string }[];
 	private _file_handlers: Map<string, { handler: FileHandler, unit: string}[]>;
+	private _message_handlers: { handler: TelegramMessageHandler, unit: string }[];
 
 	private esc(text: string): string {
 		return text.replace(/[_[\]()~`>#+\-=|{}.!]/g, '\\$&');
@@ -146,21 +184,22 @@ class TelegramBotAdapter implements ITelegramBotPluginAPIv1 {
 		return file && typeof file.download === 'function';
 	}
 
-	constructor(app: App, bot: Bot, chat_id: string, vault_path: string, download_path: string) {
+	constructor(app: App, bot: Bot, get_chat_id: () => string, vault_path: string, download_path: string) {
 		console.log("TelegramBotAdapter:constructor")
 		this._app = app;
 		this._bot = bot;
-		this._chat_id = chat_id
+		this._get_chat_id = get_chat_id;
 		this._vault_path = vault_path;
 		this._download_path = download_path;
 		this._command_handlers = new Map();
 		this._text_handlers = [];
 		this._file_handlers = new Map();
+		this._message_handlers = [];
 
 		this._bot.on("::bot_command", async (ctx: Context) => {
 			console.log("TelegramBotAdapter ::bot_command")
 			try {
-				if (String(ctx.chatId) !== this._chat_id) {
+				if (!this.isAuthorizedContext(ctx)) {
 					return;
 				}
 				const text = ctx.message?.text ?? "";
@@ -172,24 +211,14 @@ class TelegramBotAdapter implements ITelegramBotPluginAPIv1 {
 					return;
 				} 
 
-				const items = this._command_handlers.get(cmd);
-				if (!items) {
-					console.log(`There are no handlers for command ${cmd}`)
-					return;
-				}
-				let processed_before = false;
-				for (let i = 0; i < items.length; i++) {
-					const element = items[i];
-					console.log(`Executing handler for command ${cmd} from unit ${element.unit}`)
-					const reply: HandlerResult = await element.handler(args, processed_before);
-					processed_before = processed_before || reply.processed;
-					if (reply.answer) {
-						ctx.reply(`*${this.esc(element.unit)}:*\n${this.esc(reply.answer)}`, {
-							parse_mode: "MarkdownV2"
-						});
-					}
-					console.log(`Finished handler for command ${cmd} from unit ${element.unit}, processed_before=${processed_before}`)
-				}
+				await this.dispatchEnvelope(ctx, {
+					message: this.toCommandMessageContext(ctx, cmd, args),
+					legacy: {
+						type: 'command',
+						command: cmd,
+						args: args,
+					},
+				});
 
 			} catch (error) {
 				console.error(`Unexpected error: ${error}`)
@@ -198,23 +227,8 @@ class TelegramBotAdapter implements ITelegramBotPluginAPIv1 {
 		});
 
 		this._bot.on("message:file", async (ctx: Context) => {
-
-			async function handle(self: TelegramBotAdapter, specific_handlers: { handler: FileHandler; unit: string }[], obsidian_file: TFile, caption: string | undefined, processed_before: boolean) {
-				for (let i = 0; i < specific_handlers.length; i++) {
-					const element = specific_handlers[i];
-					const reply = await element.handler(obsidian_file, processed_before, caption);
-					processed_before = processed_before || reply.processed;
-					if (reply.answer) {
-						ctx.reply(`*${self.esc(element.unit)}:*\n${self.esc(reply.answer)}`, {
-							parse_mode: "MarkdownV2"
-						});
-					}
-				}
-				return processed_before;
-			}
-
 			try {
-				if (String(ctx.chatId) !== this._chat_id) {
+				if (!this.isAuthorizedContext(ctx)) {
 					return;
 				}
 
@@ -231,55 +245,23 @@ class TelegramBotAdapter implements ITelegramBotPluginAPIv1 {
 					return;
 				}
 
-				const exact_handlers = this._file_handlers.get(mime_type);
-				const all_files_handlers = this._file_handlers.get('');
-				const wildcard_handlers: { handler: FileHandler; unit: string }[] = [];
-
-				for (const [pattern, handlers] of this._file_handlers.entries()) {
-					if (!pattern || pattern === mime_type) {
-						continue;
-					}
-					if (this.mimeTypeMatches(pattern, mime_type)) {
-						wildcard_handlers.push(...handlers);
-					}
-				}
-
-				if (!exact_handlers && wildcard_handlers.length === 0 && !all_files_handlers) {
-					console.log(`There are no handlers for file with type ${mime_type}`);
-					return;
-				}
-
 				const caption = ctx.message?.caption;
-				const file = await ctx.getFile();
-				if (!this.isGrammyFile(file)) {
-					throw TypeError("type of file should be FileX");
-				}
-				const file_name = moment().format('YYYY-MM-DD-HH-mm-ss-') + file.file_path?.replace(/\//g, '-')
-				const download_dir = path.join(this._vault_path, this._download_path);
-				if (!fs.existsSync(download_dir)) {
-					fs.mkdirSync(download_dir, { recursive: true });
-				}
-  				const download_path = await file.download(path.join(this._vault_path,  this._download_path, file_name));
-				const path_in_vault = download_path.slice(this._vault_path.length+1).replace(/\\/g,'/');
-				const obsidian_file = this._app.vault.getFileByPath(path_in_vault);
-
-				if (!obsidian_file) {
-					throw TypeError(`Couldn't get file ${path_in_vault} from vault`);
-				}
-				
-				let processed_before = false;
-
-				if (exact_handlers) {
-					processed_before = await handle(this, exact_handlers, obsidian_file, caption, processed_before);
-				}
-
-				if (wildcard_handlers.length > 0) {
-					processed_before = await handle(this, wildcard_handlers, obsidian_file, caption, processed_before);
-				}
-
-				if (all_files_handlers) {
-					processed_before = await handle(this, all_files_handlers, obsidian_file, caption, processed_before);
-				}
+				const descriptor = this.toFileDescriptor(msg, caption);
+				let legacyFilePromise: Promise<TFile> | null = null;
+				await this.dispatchEnvelope(ctx, {
+					message: this.toFileMessageContext(msg, caption, descriptor),
+					legacy: {
+						type: 'file',
+						mimeType: mime_type,
+						caption: caption,
+						getFile: async () => {
+							if (!legacyFilePromise) {
+								legacyFilePromise = this.downloadLegacyFile(descriptor);
+							}
+							return legacyFilePromise;
+						},
+					},
+				});
 
 			} catch (error) {
 				console.error(`Unexpected error: ${error}`)
@@ -289,26 +271,21 @@ class TelegramBotAdapter implements ITelegramBotPluginAPIv1 {
 
 		this._bot.on("message:text", async (ctx: Context) => {
 			try {
-				if (String(ctx.chatId) !== this._chat_id) {
+				if (!this.isAuthorizedContext(ctx)) {
 					return;
 				}
 				const text = ctx.message?.text!;
-				console.log("TelegramBotAdapter: message:text=",text)
-				if (this._text_handlers.length === 0) {
-					console.log(`There are no handlers for text messages`)
+				if (text.trim().startsWith('/')) {
 					return;
 				}
-				let processed_before = false;
-				for (let i = 0; i < this._text_handlers.length; i++) {
-					const element = this._text_handlers[i];
-					const reply: HandlerResult = await element.handler(text, processed_before);
-					processed_before = processed_before || reply.processed;
-					if (reply.answer) {
-						ctx.reply(`*${this.esc(element.unit)}:*\n${this.esc(reply.answer)}`, {
-							parse_mode: "MarkdownV2"
-						});
-					}					
-				}
+				console.log("TelegramBotAdapter: message:text=",text)
+				await this.dispatchEnvelope(ctx, {
+					message: this.toTextMessageContext(ctx, text),
+					legacy: {
+						type: 'text',
+						text: text,
+					},
+				});
 			} catch (error) {
 				console.error(`Unexpected error: ${error}`)
     			await ctx.reply('❌ Internal error');
@@ -345,8 +322,45 @@ class TelegramBotAdapter implements ITelegramBotPluginAPIv1 {
 		console.log(this._file_handlers)
 	}
 
+	registerMessageHandler(handler: TelegramMessageHandler, unit_name: string): void {
+		this._message_handlers.push({ handler: handler, unit: unit_name });
+	}
+
+	async saveFileToVault(
+		file: TelegramFileDescriptor,
+		options: SaveTelegramFileOptions,
+	): Promise<TFile> {
+		const telegramFile = await this._bot.api.getFile(file.fileId) as GrammyFile;
+		if (!this.isGrammyFile(telegramFile)) {
+			throw new TypeError("Couldn't hydrate Telegram file for download");
+		}
+
+		const normalizedFolder = normalizePath(options.folder);
+		await this.ensureVaultFolder(normalizedFolder);
+		const fileName = options.fileName?.trim() || file.suggestedName;
+		const pathInVault = await this.resolveVaultPath(
+			normalizedFolder,
+			fileName,
+			options.conflictStrategy ?? 'rename',
+		);
+		const absolutePath = path.join(this._vault_path, ...pathInVault.split('/'));
+		await telegramFile.download(absolutePath);
+
+		const obsidianFile = this._app.vault.getFileByPath(pathInVault);
+		if (!obsidianFile) {
+			throw new TypeError(`Couldn't get file ${pathInVault} from vault`);
+		}
+
+		return obsidianFile;
+	}
+
 	async sendMessage(text: string): Promise<void> {
-		await this._bot.api.sendMessage(this._chat_id, this.esc(text), {
+		const chatId = this.getAuthorizedChatId();
+		if (!chatId) {
+			throw new Error("Authorized chat is not configured.");
+		}
+
+		await this._bot.api.sendMessage(chatId, this.esc(text), {
 			parse_mode: 'MarkdownV2'			
 		});
 	}
@@ -360,6 +374,403 @@ class TelegramBotAdapter implements ITelegramBotPluginAPIv1 {
 		for (const [mime, handlers] of this._file_handlers.entries()) {
 			this._file_handlers.set(mime, handlers.filter(h => h.unit !== unit_name));
 		}
+		this._message_handlers = this._message_handlers.filter(h => h.unit !== unit_name);
+	}
+
+	private isAuthorizedContext(ctx: Context): boolean {
+		const chatId = this.getAuthorizedChatId();
+		return chatId !== '' && String(ctx.chatId) === chatId;
+	}
+
+	private getAuthorizedChatId(): string {
+		return this._get_chat_id().trim();
+	}
+
+	private async replyFromUnit(ctx: Context, unit: string, answer: string): Promise<void> {
+		await ctx.reply(`*${this.esc(unit)}:*\n${this.esc(answer)}`, {
+			parse_mode: "MarkdownV2"
+		});
+	}
+
+	private async dispatchEnvelope(
+		ctx: Context,
+		envelope: TelegramEventEnvelope,
+	): Promise<boolean> {
+		let processed_before = await this.dispatchMessageHandlers(
+			ctx,
+			envelope.message,
+			false,
+		);
+
+		if (!envelope.legacy) {
+			return processed_before;
+		}
+
+		return this.dispatchLegacyHandlers(ctx, envelope.legacy, processed_before);
+	}
+
+	private async dispatchMessageHandlers(
+		ctx: Context,
+		message: TelegramMessageContext,
+		processed_before: boolean,
+	): Promise<boolean> {
+		for (let i = 0; i < this._message_handlers.length; i++) {
+			const element = this._message_handlers[i];
+			const reply = await element.handler(message, processed_before);
+			processed_before = processed_before || reply.processed;
+			if (reply.answer) {
+				await this.replyFromUnit(ctx, element.unit, reply.answer);
+			}
+		}
+
+		return processed_before;
+	}
+
+	private async dispatchLegacyHandlers(
+		ctx: Context,
+		legacy: LegacyEnvelope,
+		processed_before: boolean,
+	): Promise<boolean> {
+		if (legacy.type === 'command') {
+			return this.dispatchLegacyCommandHandlers(
+				ctx,
+				legacy.command,
+				legacy.args,
+				processed_before,
+			);
+		}
+
+		if (legacy.type === 'text') {
+			return this.dispatchLegacyTextHandlers(ctx, legacy.text, processed_before);
+		}
+
+		return this.dispatchLegacyFileHandlers(
+			ctx,
+			legacy.mimeType,
+			legacy.getFile,
+			legacy.caption,
+			processed_before,
+		);
+	}
+
+	private async dispatchLegacyCommandHandlers(
+		ctx: Context,
+		command: string,
+		args: string,
+		processed_before: boolean,
+	): Promise<boolean> {
+		const items = this._command_handlers.get(command);
+		if (!items || items.length === 0) {
+			console.log(`There are no handlers for command ${command}`);
+			return processed_before;
+		}
+
+		for (let i = 0; i < items.length; i++) {
+			const element = items[i];
+			console.log(`Executing handler for command ${command} from unit ${element.unit}`);
+			const reply: HandlerResult = await element.handler(args, processed_before);
+			processed_before = processed_before || reply.processed;
+			if (reply.answer) {
+				await this.replyFromUnit(ctx, element.unit, reply.answer);
+			}
+			console.log(`Finished handler for command ${command} from unit ${element.unit}, processed_before=${processed_before}`);
+		}
+
+		return processed_before;
+	}
+
+	private async dispatchLegacyTextHandlers(
+		ctx: Context,
+		text: string,
+		processed_before: boolean,
+	): Promise<boolean> {
+		if (this._text_handlers.length === 0) {
+			console.log(`There are no handlers for text messages`);
+			return processed_before;
+		}
+
+		for (let i = 0; i < this._text_handlers.length; i++) {
+			const element = this._text_handlers[i];
+			const reply: HandlerResult = await element.handler(text, processed_before);
+			processed_before = processed_before || reply.processed;
+			if (reply.answer) {
+				await this.replyFromUnit(ctx, element.unit, reply.answer);
+			}
+		}
+
+		return processed_before;
+	}
+
+	private async dispatchLegacyFileHandlers(
+		ctx: Context,
+		mimeType: string,
+		getFile: () => Promise<TFile>,
+		caption: string | undefined,
+		processed_before: boolean,
+	): Promise<boolean> {
+		const exact_handlers = this._file_handlers.get(mimeType);
+		const all_files_handlers = this._file_handlers.get('');
+		const wildcard_handlers: { handler: FileHandler; unit: string }[] = [];
+
+		for (const [pattern, handlers] of this._file_handlers.entries()) {
+			if (!pattern || pattern === mimeType) {
+				continue;
+			}
+			if (this.mimeTypeMatches(pattern, mimeType)) {
+				wildcard_handlers.push(...handlers);
+			}
+		}
+
+		if (!exact_handlers && wildcard_handlers.length === 0 && !all_files_handlers) {
+			console.log(`There are no legacy file handlers for file with type ${mimeType}`);
+			return processed_before;
+		}
+
+		const obsidian_file = await getFile();
+		processed_before = await this.executeLegacyFileHandlers(
+			ctx,
+			exact_handlers,
+			obsidian_file,
+			caption,
+			processed_before,
+		);
+		processed_before = await this.executeLegacyFileHandlers(
+			ctx,
+			wildcard_handlers,
+			obsidian_file,
+			caption,
+			processed_before,
+		);
+		processed_before = await this.executeLegacyFileHandlers(
+			ctx,
+			all_files_handlers,
+			obsidian_file,
+			caption,
+			processed_before,
+		);
+
+		return processed_before;
+	}
+
+	private async executeLegacyFileHandlers(
+		ctx: Context,
+		handlers: { handler: FileHandler; unit: string }[] | undefined,
+		obsidian_file: TFile,
+		caption: string | undefined,
+		processed_before: boolean,
+	): Promise<boolean> {
+		if (!handlers || handlers.length === 0) {
+			return processed_before;
+		}
+
+		for (let i = 0; i < handlers.length; i++) {
+			const element = handlers[i];
+			const reply = await element.handler(obsidian_file, processed_before, caption);
+			processed_before = processed_before || reply.processed;
+			if (reply.answer) {
+				await this.replyFromUnit(ctx, element.unit, reply.answer);
+			}
+		}
+
+		return processed_before;
+	}
+
+	private toCommandMessageContext(
+		ctx: Context,
+		cmd: string,
+		args: string,
+	): TelegramMessageContext {
+		return {
+			messageId: ctx.message?.message_id,
+			date: ctx.message?.date,
+			kind: 'command',
+			text: ctx.message?.text,
+			command: {
+				name: cmd,
+				args: args,
+			},
+			files: [],
+			raw: ctx.msg,
+		};
+	}
+
+	private toTextMessageContext(ctx: Context, text: string): TelegramMessageContext {
+		return {
+			messageId: ctx.message?.message_id,
+			date: ctx.message?.date,
+			kind: text.trim().startsWith('/') ? 'command' : 'text',
+			text: text,
+			files: [],
+			raw: ctx.msg,
+		};
+	}
+
+	private toFileMessageContext(
+		msg: Message,
+		caption: string | undefined,
+		file: TelegramFileDescriptor,
+	): TelegramMessageContext {
+		return {
+			messageId: msg.message_id,
+			date: msg.date,
+			kind: file.kind,
+			text: caption,
+			caption: caption,
+			files: [file],
+			raw: msg,
+		};
+	}
+
+	private toFileDescriptor(
+		msg: Message,
+		caption: string | undefined,
+	): TelegramFileDescriptor {
+		if (msg.document) {
+			return {
+				fileId: msg.document.file_id,
+				uniqueId: msg.document.file_unique_id,
+				kind: 'document',
+				mimeType: msg.document.mime_type,
+				size: msg.document.file_size,
+				suggestedName: msg.document.file_name ?? `document-${msg.message_id}`,
+				caption: caption,
+			};
+		}
+		if (msg.photo && msg.photo.length > 0) {
+			const photo = msg.photo[msg.photo.length - 1];
+			return {
+				fileId: photo.file_id,
+				uniqueId: photo.file_unique_id,
+				kind: 'photo',
+				mimeType: 'image/jpeg',
+				size: photo.file_size,
+				suggestedName: `photo-${msg.message_id}.jpg`,
+				caption: caption,
+			};
+		}
+		if (msg.voice) {
+			return {
+				fileId: msg.voice.file_id,
+				uniqueId: msg.voice.file_unique_id,
+				kind: 'voice',
+				mimeType: msg.voice.mime_type,
+				size: msg.voice.file_size,
+				suggestedName: `voice-${msg.message_id}.${this.extensionFromMimeType(msg.voice.mime_type, 'ogg')}`,
+				caption: caption,
+			};
+		}
+		if (msg.video) {
+			return {
+				fileId: msg.video.file_id,
+				uniqueId: msg.video.file_unique_id,
+				kind: 'video',
+				mimeType: msg.video.mime_type,
+				size: msg.video.file_size,
+				suggestedName: msg.video.file_name ?? `video-${msg.message_id}.${this.extensionFromMimeType(msg.video.mime_type, 'mp4')}`,
+				caption: caption,
+			};
+		}
+		if (msg.video_note) {
+			return {
+				fileId: msg.video_note.file_id,
+				uniqueId: msg.video_note.file_unique_id,
+				kind: 'video_note',
+				mimeType: 'video/mp4',
+				size: msg.video_note.file_size,
+				suggestedName: `video-note-${msg.message_id}.mp4`,
+				caption: caption,
+			};
+		}
+		if (msg.audio) {
+			return {
+				fileId: msg.audio.file_id,
+				uniqueId: msg.audio.file_unique_id,
+				kind: 'audio',
+				mimeType: msg.audio.mime_type,
+				size: msg.audio.file_size,
+				suggestedName: msg.audio.file_name ?? `audio-${msg.message_id}.${this.extensionFromMimeType(msg.audio.mime_type, 'mp3')}`,
+				caption: caption,
+			};
+		}
+		if (msg.animation) {
+			return {
+				fileId: msg.animation.file_id,
+				uniqueId: msg.animation.file_unique_id,
+				kind: 'animation',
+				mimeType: msg.animation.mime_type,
+				size: msg.animation.file_size,
+				suggestedName: msg.animation.file_name ?? `animation-${msg.message_id}.${this.extensionFromMimeType(msg.animation.mime_type, 'gif')}`,
+				caption: caption,
+			};
+		}
+
+		throw new TypeError("Unsupported file message");
+	}
+
+	private extensionFromMimeType(mimeType: string | undefined, fallback: string): string {
+		if (!mimeType || !mimeType.includes('/')) {
+			return fallback;
+		}
+
+		const extension = mimeType.split('/')[1];
+		return extension || fallback;
+	}
+
+	private async downloadLegacyFile(file: TelegramFileDescriptor): Promise<TFile> {
+		return this.saveFileToVault(file, {
+			folder: this._download_path,
+			fileName: `${moment().format('YYYY-MM-DD-HH-mm-ss-')}${file.suggestedName.replace(/[\\/]/g, '-')}`,
+			conflictStrategy: 'rename',
+		});
+	}
+
+	private async ensureVaultFolder(folder: string): Promise<void> {
+		if (!folder) {
+			return;
+		}
+
+		let current = "";
+		for (const part of folder.split('/')) {
+			current = current ? `${current}/${part}` : part;
+			if (!this._app.vault.getAbstractFileByPath(current)) {
+				await this._app.vault.createFolder(current);
+			}
+		}
+	}
+
+	private async resolveVaultPath(
+		folder: string,
+		fileName: string,
+		conflictStrategy: 'rename' | 'replace' | 'error',
+	): Promise<string> {
+		const initialPath = normalizePath(folder ? `${folder}/${fileName}` : fileName);
+		const existing = this._app.vault.getAbstractFileByPath(initialPath);
+		if (!existing) {
+			return initialPath;
+		}
+		if (conflictStrategy === 'error') {
+			throw new Error(`File already exists: ${initialPath}`);
+		}
+		if (conflictStrategy === 'replace') {
+			if (!(existing instanceof TFile)) {
+				throw new Error(`Target path is not a file: ${initialPath}`);
+			}
+			await this._app.vault.delete(existing);
+			return initialPath;
+		}
+
+		const extensionIndex = initialPath.lastIndexOf(".");
+		const hasExtension = extensionIndex > initialPath.lastIndexOf("/");
+		const base = hasExtension ? initialPath.slice(0, extensionIndex) : initialPath;
+		const extension = hasExtension ? initialPath.slice(extensionIndex) : "";
+
+		let counter = 1;
+		let candidate = `${base} ${counter}${extension}`;
+		while (this._app.vault.getAbstractFileByPath(candidate)) {
+			counter += 1;
+			candidate = `${base} ${counter}${extension}`;
+		}
+		return candidate;
 	}
 } 
 
@@ -370,6 +781,10 @@ export default class TelegramBotPlugin extends Plugin {
 	private _api: TelegramBotAdapter;
 
 	public getAPIv1(): ITelegramBotPluginAPIv1 {
+		return this._api;
+	}
+
+	public getAPIv2(): ITelegramBotPluginAPIv2 {
 		return this._api;
 	}
 
@@ -420,7 +835,13 @@ export default class TelegramBotPlugin extends Plugin {
 			throw new TypeError('this.app.vault.adapter should be instanceof FileSystemAdapter!');
 		}
 
-		this._api = new TelegramBotAdapter(this.app, this._bot, this.settings.chatId, adapter.getBasePath(), this.settings.downloadPath);
+		this._api = new TelegramBotAdapter(
+			this.app,
+			this._bot,
+			() => this.settings.chatId,
+			adapter.getBasePath(),
+			this.settings.downloadPath,
+		);
 		this._bot.start();
 	}
 

@@ -94,6 +94,67 @@ interface ITelegramBotPluginAPIv1 {
 }
 ```
 
+### API v2
+
+`ITelegramBotPluginAPIv2` adds a transport-oriented message model for plugins that need more control over Telegram payloads, especially files.
+
+Highlights:
+
+- one normalized message handler for commands, text, and files
+- file descriptors are passed before anything is saved into the vault
+- plugin decides where to persist the file
+- `v1` remains available for backward compatibility
+
+```typescript
+interface ITelegramBotPluginAPIv2 {
+  registerMessageHandler(
+    handler: (
+      message: TelegramMessageContext,
+      processedBefore: boolean
+    ) => Promise<HandlerResult>,
+    unitName: string
+  ): void;
+
+  saveFileToVault(
+    file: TelegramFileDescriptor,
+    options: {
+      folder: string;
+      fileName?: string;
+      conflictStrategy?: "rename" | "replace" | "error";
+    }
+  ): Promise<TFile>;
+
+  sendMessage(text: string): Promise<void>;
+  disposeHandlersForUnit(unitName: string): void;
+}
+```
+
+Example:
+
+```typescript
+const telegramAPI = app.plugins.plugins['obsidian-telegram-bot-plugin']?.getAPIv2?.();
+
+telegramAPI?.registerMessageHandler(async (message, processedBefore) => {
+  if (processedBefore) {
+    return { processed: false, answer: null };
+  }
+
+  if (message.files.length === 0) {
+    return { processed: false, answer: null };
+  }
+
+  const saved = await telegramAPI.saveFileToVault(message.files[0], {
+    folder: "Attachments",
+    conflictStrategy: "rename",
+  });
+
+  return {
+    processed: true,
+    answer: `Saved ${saved.name}`,
+  };
+}, "my-plugin");
+```
+
 ## Usage Examples
 
 ### Voice Message Transcription Plugin
