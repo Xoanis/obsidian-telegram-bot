@@ -14,9 +14,16 @@ import {
 	FileHandler,
 	TelegramMessageContext,
 	TelegramMessageHandler,
-	TelegramMessageKind,
 	TelegramFileDescriptor,
 	SaveTelegramFileOptions,
+	TelegramCallbackContext,
+	TelegramCallbackHandler,
+	TelegramFocusedInputHandler,
+	InputFocusState,
+	SetInputFocusOptions,
+	TelegramCallbackPayload,
+	SendMessageOptions,
+	SentTelegramMessageRef,
 } from './telegram_plugin_api';
 
 const moment = window.moment;
@@ -115,6 +122,9 @@ interface TelegramEventEnvelope {
 	legacy?: LegacyEnvelope;
 }
 
+interface StoredFocusState extends InputFocusState {
+}
+
 const DEFAULT_SETTINGS: TelegramBotPluginSettings = {
 	botToken: '',
 	chatId: '',
@@ -131,6 +141,9 @@ class TelegramBotAdapter implements ITelegramBotPluginAPIv1, ITelegramBotPluginA
 	private _text_handlers: { handler: TextHandler, unit: string }[];
 	private _file_handlers: Map<string, { handler: FileHandler, unit: string}[]>;
 	private _message_handlers: { handler: TelegramMessageHandler, unit: string }[];
+	private _callback_handlers: { handler: TelegramCallbackHandler, unit: string }[];
+	private _focused_input_handlers: { handler: TelegramFocusedInputHandler, unit: string }[];
+	private _input_focus: StoredFocusState | null;
 
 	private esc(text: string): string {
 		return text.replace(/[_[\]()~`>#+\-=|{}.!]/g, '\\$&');
@@ -195,6 +208,9 @@ class TelegramBotAdapter implements ITelegramBotPluginAPIv1, ITelegramBotPluginA
 		this._text_handlers = [];
 		this._file_handlers = new Map();
 		this._message_handlers = [];
+		this._callback_handlers = [];
+		this._focused_input_handlers = [];
+		this._input_focus = null;
 
 		this._bot.on("::bot_command", async (ctx: Context) => {
 			console.log("TelegramBotAdapter ::bot_command")
@@ -202,6 +218,8 @@ class TelegramBotAdapter implements ITelegramBotPluginAPIv1, ITelegramBotPluginA
 				if (!this.isAuthorizedContext(ctx)) {
 					return;
 				}
+				this.clearExpiredFocus();
+				await this.clearInputFocus();
 				const text = ctx.message?.text ?? "";
 				const [cmd, ...cmdArgs] = text.slice(1).trim().split(/\s+/);
 				const args = cmdArgs.join(" ");
@@ -247,9 +265,24 @@ class TelegramBotAdapter implements ITelegramBotPluginAPIv1, ITelegramBotPluginA
 
 				const caption = ctx.message?.caption;
 				const descriptor = this.toFileDescriptor(msg, caption);
+				const fileMessage = this.toFileMessageContext(msg, caption, descriptor);
+				const focus = this.getValidFocus();
+				if (focus && focus.mode !== 'next-text') {
+					const processed = await this.dispatchFocusedInputHandlers(
+						ctx,
+						fileMessage,
+						focus,
+					);
+					if (processed) {
+						if (focus.mode !== 'session') {
+							await this.clearInputFocus(focus.unitName);
+						}
+						return;
+					}
+				}
 				let legacyFilePromise: Promise<TFile> | null = null;
 				await this.dispatchEnvelope(ctx, {
-					message: this.toFileMessageContext(msg, caption, descriptor),
+					message: fileMessage,
 					legacy: {
 						type: 'file',
 						mimeType: mime_type,
@@ -274,11 +307,26 @@ class TelegramBotAdapter implements ITelegramBotPluginAPIv1, ITelegramBotPluginA
 				if (!this.isAuthorizedContext(ctx)) {
 					return;
 				}
+				this.clearExpiredFocus();
 				const text = ctx.message?.text!;
 				if (text.trim().startsWith('/')) {
 					return;
 				}
 				console.log("TelegramBotAdapter: message:text=",text)
+				const focus = this.getValidFocus();
+				if (focus) {
+					const processed = await this.dispatchFocusedInputHandlers(
+						ctx,
+						this.toTextMessageContext(ctx, text),
+						focus,
+					);
+					if (processed) {
+						if (focus.mode !== 'session') {
+							await this.clearInputFocus(focus.unitName);
+						}
+						return;
+					}
+				}
 				await this.dispatchEnvelope(ctx, {
 					message: this.toTextMessageContext(ctx, text),
 					legacy: {
@@ -288,7 +336,34 @@ class TelegramBotAdapter implements ITelegramBotPluginAPIv1, ITelegramBotPluginA
 				});
 			} catch (error) {
 				console.error(`Unexpected error: ${error}`)
-    			await ctx.reply('❌ Internal error');
+				await ctx.reply('❌ Internal error');
+			}
+		});
+
+		this._bot.on("callback_query:data", async (ctx: Context) => {
+			try {
+				if (!this.isAuthorizedContext(ctx)) {
+					return;
+				}
+				this.clearExpiredFocus();
+				const data = ctx.callbackQuery?.data;
+				if (!data) {
+					return;
+				}
+
+				const callback: TelegramCallbackContext = {
+					messageId: ctx.callbackQuery.message?.message_id,
+					callbackId: ctx.callbackQuery.id,
+					data: data,
+					raw: ctx.callbackQuery,
+				};
+
+				await this.dispatchCallbackHandlers(ctx, callback, false);
+			} catch (error) {
+				console.error(`Unexpected error: ${error}`);
+				if (ctx.callbackQuery?.id) {
+					await ctx.answerCallbackQuery({ text: '❌ Internal error' });
+				}
 			}
 		});
 	}
@@ -326,6 +401,44 @@ class TelegramBotAdapter implements ITelegramBotPluginAPIv1, ITelegramBotPluginA
 		this._message_handlers.push({ handler: handler, unit: unit_name });
 	}
 
+	registerCallbackHandler(handler: TelegramCallbackHandler, unit_name: string): void {
+		this._callback_handlers.push({ handler: handler, unit: unit_name });
+	}
+
+	registerFocusedInputHandler(handler: TelegramFocusedInputHandler, unit_name: string): void {
+		this._focused_input_handlers.push({ handler: handler, unit: unit_name });
+	}
+
+	async setInputFocus(
+		unit_name: string,
+		options?: SetInputFocusOptions,
+	): Promise<void> {
+		const expiresAt = options?.expiresInMs
+			? Date.now() + options.expiresInMs
+			: undefined;
+		this._input_focus = {
+			unitName: unit_name,
+			mode: options?.mode ?? 'next-text',
+			context: options?.context,
+			expiresAt: expiresAt,
+		};
+	}
+
+	async clearInputFocus(unit_name?: string): Promise<void> {
+		if (!this._input_focus) {
+			return;
+		}
+		if (unit_name && this._input_focus.unitName !== unit_name) {
+			return;
+		}
+		this._input_focus = null;
+	}
+
+	async getInputFocus(): Promise<InputFocusState | null> {
+		this.clearExpiredFocus();
+		return this._input_focus;
+	}
+
 	async saveFileToVault(
 		file: TelegramFileDescriptor,
 		options: SaveTelegramFileOptions,
@@ -354,15 +467,65 @@ class TelegramBotAdapter implements ITelegramBotPluginAPIv1, ITelegramBotPluginA
 		return obsidianFile;
 	}
 
-	async sendMessage(text: string): Promise<void> {
+	async sendMessage(
+		text: string,
+		options?: SendMessageOptions,
+	): Promise<SentTelegramMessageRef> {
 		const chatId = this.getAuthorizedChatId();
 		if (!chatId) {
 			throw new Error("Authorized chat is not configured.");
 		}
 
-		await this._bot.api.sendMessage(chatId, this.esc(text), {
-			parse_mode: 'MarkdownV2'			
+		const message = await this._bot.api.sendMessage(chatId, this.esc(text), {
+			parse_mode: 'MarkdownV2',
+			reply_markup: this.buildInlineKeyboard(options?.inlineKeyboard),
 		});
+		return { messageId: message.message_id };
+	}
+
+	async editMessage(
+		messageId: number,
+		text: string,
+		options?: SendMessageOptions,
+	): Promise<void> {
+		const chatId = this.getAuthorizedChatId();
+		if (!chatId) {
+			throw new Error("Authorized chat is not configured.");
+		}
+
+		await this._bot.api.editMessageText(chatId, messageId, this.esc(text), {
+			parse_mode: 'MarkdownV2',
+			reply_markup: this.buildInlineKeyboard(options?.inlineKeyboard),
+		});
+	}
+
+	async deleteMessage(messageId: number): Promise<void> {
+		const chatId = this.getAuthorizedChatId();
+		if (!chatId) {
+			throw new Error("Authorized chat is not configured.");
+		}
+
+		await this._bot.api.deleteMessage(chatId, messageId);
+	}
+
+	async answerCallbackQuery(callbackId: string, text?: string): Promise<void> {
+		await this._bot.api.answerCallbackQuery(callbackId, text ? { text } : {});
+	}
+
+	encodeCallbackPayload(payload: TelegramCallbackPayload): string {
+		return JSON.stringify(payload);
+	}
+
+	decodeCallbackPayload(data: string): TelegramCallbackPayload | null {
+		try {
+			const parsed = JSON.parse(data) as TelegramCallbackPayload;
+			if (!parsed || typeof parsed.unit !== 'string' || typeof parsed.action !== 'string') {
+				return null;
+			}
+			return parsed;
+		} catch {
+			return null;
+		}
 	}
 
 	disposeHandlersForUnit(unit_name: string): void {
@@ -375,6 +538,11 @@ class TelegramBotAdapter implements ITelegramBotPluginAPIv1, ITelegramBotPluginA
 			this._file_handlers.set(mime, handlers.filter(h => h.unit !== unit_name));
 		}
 		this._message_handlers = this._message_handlers.filter(h => h.unit !== unit_name);
+		this._callback_handlers = this._callback_handlers.filter(h => h.unit !== unit_name);
+		this._focused_input_handlers = this._focused_input_handlers.filter(h => h.unit !== unit_name);
+		if (this._input_focus?.unitName === unit_name) {
+			this._input_focus = null;
+		}
 	}
 
 	private isAuthorizedContext(ctx: Context): boolean {
@@ -384,6 +552,36 @@ class TelegramBotAdapter implements ITelegramBotPluginAPIv1, ITelegramBotPluginA
 
 	private getAuthorizedChatId(): string {
 		return this._get_chat_id().trim();
+	}
+
+	private clearExpiredFocus(): void {
+		if (!this._input_focus?.expiresAt) {
+			return;
+		}
+		if (this._input_focus.expiresAt <= Date.now()) {
+			this._input_focus = null;
+		}
+	}
+
+	private getValidFocus(): StoredFocusState | null {
+		this.clearExpiredFocus();
+		return this._input_focus;
+	}
+
+	private buildInlineKeyboard(keyboard?: SendMessageOptions['inlineKeyboard']) {
+		if (!keyboard || keyboard.length === 0) {
+			return undefined;
+		}
+
+		const inlineKeyboard = new InlineKeyboard();
+		for (const row of keyboard) {
+			for (const button of row) {
+				inlineKeyboard.text(button.text, button.callbackData);
+			}
+			inlineKeyboard.row();
+		}
+
+		return inlineKeyboard;
 	}
 
 	private async replyFromUnit(ctx: Context, unit: string, answer: string): Promise<void> {
@@ -409,6 +607,31 @@ class TelegramBotAdapter implements ITelegramBotPluginAPIv1, ITelegramBotPluginA
 		return this.dispatchLegacyHandlers(ctx, envelope.legacy, processed_before);
 	}
 
+	private async dispatchFocusedInputHandlers(
+		ctx: Context,
+		message: TelegramMessageContext,
+		focus: StoredFocusState,
+	): Promise<boolean> {
+		const handlers = this._focused_input_handlers.filter(
+			(item) => item.unit === focus.unitName,
+		);
+		if (handlers.length === 0) {
+			return false;
+		}
+
+		let processed = false;
+		for (let i = 0; i < handlers.length; i++) {
+			const element = handlers[i];
+			const reply = await element.handler(message, focus);
+			processed = processed || reply.processed;
+			if (reply.answer) {
+				await this.replyFromUnit(ctx, element.unit, reply.answer);
+			}
+		}
+
+		return processed;
+	}
+
 	private async dispatchMessageHandlers(
 		ctx: Context,
 		message: TelegramMessageContext,
@@ -421,6 +644,27 @@ class TelegramBotAdapter implements ITelegramBotPluginAPIv1, ITelegramBotPluginA
 			if (reply.answer) {
 				await this.replyFromUnit(ctx, element.unit, reply.answer);
 			}
+		}
+
+		return processed_before;
+	}
+
+	private async dispatchCallbackHandlers(
+		ctx: Context,
+		callback: TelegramCallbackContext,
+		processed_before: boolean,
+	): Promise<boolean> {
+		for (let i = 0; i < this._callback_handlers.length; i++) {
+			const element = this._callback_handlers[i];
+			const reply = await element.handler(callback, processed_before);
+			processed_before = processed_before || reply.processed;
+			if (reply.answer) {
+				await this.answerCallbackQuery(callback.callbackId, reply.answer);
+			}
+		}
+
+		if (!processed_before && callback.callbackId) {
+			await this.answerCallbackQuery(callback.callbackId);
 		}
 
 		return processed_before;
