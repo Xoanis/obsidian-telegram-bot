@@ -1,4 +1,4 @@
-import { App, FileSystemAdapter, Notice, Plugin, PluginSettingTab, Setting, TFile, normalizePath } from 'obsidian';
+import { App, FileSystemAdapter, Notice, Plugin, PluginSettingTab, Setting, TFile, normalizePath, requestUrl } from 'obsidian';
 import { Bot, type Context, InlineKeyboard, GrammyError, HttpError } from "grammy";
 import { Message, type File } from 'grammy/types';
 import { type FileFlavor, hydrateFiles } from "@grammyjs/files";
@@ -456,15 +456,8 @@ class TelegramBotAdapter implements ITelegramBotPluginAPIv1, ITelegramBotPluginA
 			fileName,
 			options.conflictStrategy ?? 'rename',
 		);
-		const absolutePath = path.join(this._vault_path, ...pathInVault.split('/'));
-		await telegramFile.download(absolutePath);
-
-		const obsidianFile = this._app.vault.getFileByPath(pathInVault);
-		if (!obsidianFile) {
-			throw new TypeError(`Couldn't get file ${pathInVault} from vault`);
-		}
-
-		return obsidianFile;
+		const fileBytes = await this.downloadTelegramFile(telegramFile, file.suggestedName);
+		return this._app.vault.createBinary(pathInVault, fileBytes);
 	}
 
 	async sendMessage(
@@ -594,6 +587,15 @@ class TelegramBotAdapter implements ITelegramBotPluginAPIv1, ITelegramBotPluginA
 		ctx: Context,
 		envelope: TelegramEventEnvelope,
 	): Promise<boolean> {
+		if (envelope.legacy?.type === 'file') {
+			const processedByLegacy = await this.dispatchLegacyHandlers(ctx, envelope.legacy, false);
+			return this.dispatchMessageHandlers(
+				ctx,
+				envelope.message,
+				processedByLegacy,
+			);
+		}
+
 		let processed_before = await this.dispatchMessageHandlers(
 			ctx,
 			envelope.message,
@@ -980,6 +982,94 @@ class TelegramBotAdapter implements ITelegramBotPluginAPIv1, ITelegramBotPluginA
 				await this._app.vault.createFolder(current);
 			}
 		}
+	}
+
+	private async downloadTelegramFile(
+		telegramFile: GrammyFile,
+		suggestedName: string,
+	): Promise<ArrayBuffer> {
+		const errors: string[] = [];
+
+		try {
+			return await this.downloadTelegramFileViaFetch(telegramFile);
+		} catch (error) {
+			errors.push(`fetch download failed: ${this.describeError(error)}`);
+			console.warn(`Telegram fetch download failed for ${suggestedName}:`, error);
+		}
+
+		try {
+			return await this.downloadTelegramFileViaGrammY(telegramFile);
+		} catch (error) {
+			errors.push(`grammY download failed: ${this.describeError(error)}`);
+			console.error(`Telegram grammY download failed for ${suggestedName}:`, error);
+		}
+
+		throw new Error(`Failed to download Telegram file "${suggestedName}". ${errors.join(' | ')}`);
+	}
+
+	private async downloadTelegramFileViaFetch(
+		telegramFile: GrammyFile,
+	): Promise<ArrayBuffer> {
+		const url = telegramFile.getUrl();
+		const response = await requestUrl({
+			url,
+			method: 'GET',
+			throw: false,
+		});
+		if (response.status >= 400) {
+			throw new Error(`HTTP ${response.status}`);
+		}
+
+		return response.arrayBuffer;
+	}
+
+	private async downloadTelegramFileViaGrammY(
+		telegramFile: GrammyFile,
+	): Promise<ArrayBuffer> {
+		const tempPath = await telegramFile.download();
+		try {
+			const fileBuffer = await fs.promises.readFile(tempPath);
+			return fileBuffer.buffer.slice(
+				fileBuffer.byteOffset,
+				fileBuffer.byteOffset + fileBuffer.byteLength,
+			);
+		} finally {
+			await fs.promises.rm(path.dirname(tempPath), {
+				recursive: true,
+				force: true,
+			});
+		}
+	}
+
+	private describeError(error: unknown): string {
+		const aggregate = this.asAggregateErrorLike(error);
+		if (aggregate) {
+			const nested = aggregate.errors
+				.map((entry: unknown) => this.describeError(entry))
+				.filter((entry) => entry.length > 0)
+				.join('; ');
+			return nested ? `${aggregate.message}: ${nested}` : aggregate.message;
+		}
+		if (error instanceof Error) {
+			return error.message;
+		}
+		return String(error);
+	}
+
+	private asAggregateErrorLike(error: unknown): { message: string; errors: unknown[] } | null {
+		if (!error || typeof error !== 'object') {
+			return null;
+		}
+
+		const maybeAggregate = error as { message?: unknown; errors?: unknown };
+		if (!Array.isArray(maybeAggregate.errors)) {
+			return null;
+		}
+
+		return {
+			message: typeof maybeAggregate.message === 'string' ? maybeAggregate.message : 'Aggregate error',
+			errors: maybeAggregate.errors,
+		};
 	}
 
 	private async resolveVaultPath(
