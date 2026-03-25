@@ -1,5 +1,5 @@
 import { App, FileSystemAdapter, Notice, Plugin, PluginSettingTab, Setting, TFile, normalizePath, requestUrl } from 'obsidian';
-import { Bot, type Context, InlineKeyboard, GrammyError, HttpError } from "grammy";
+import { Bot, type Context, InlineKeyboard } from "grammy";
 import { Message, type File } from 'grammy/types';
 import { type FileFlavor, hydrateFiles } from "@grammyjs/files";
 
@@ -23,7 +23,19 @@ import {
 	SetInputFocusOptions,
 	TelegramCallbackPayload,
 	SendMessageOptions,
+	SendDocumentOptions,
+	SendFileOptions,
+	SendPhotoOptions,
+	SendAudioOptions,
+	SendVideoOptions,
+	SendAnimationOptions,
+	SendVoiceOptions,
+	SendVideoNoteOptions,
+	TelegramMediaGroupItem,
+	TelegramLocation,
+	SendLocationOptions,
 	SentTelegramMessageRef,
+	TelegramOutboundFile,
 } from './telegram_plugin_api';
 
 const moment = window.moment;
@@ -125,6 +137,11 @@ interface TelegramEventEnvelope {
 interface StoredFocusState extends InputFocusState {
 }
 
+interface OutboundBinaryFile {
+	fileName: string;
+	bytes: Uint8Array;
+}
+
 const DEFAULT_SETTINGS: TelegramBotPluginSettings = {
 	botToken: '',
 	chatId: '',
@@ -134,7 +151,6 @@ const DEFAULT_SETTINGS: TelegramBotPluginSettings = {
 class TelegramBotAdapter implements ITelegramBotPluginAPIv1, ITelegramBotPluginAPIv2 {
 	private _app: App;
 	private _bot: Bot;
-	private readonly _vault_path: string;
 	private readonly _download_path: string;
 	private readonly _get_chat_id: () => string;
 	private _command_handlers: Map<string,{ handler: CommandHandler, unit: string }[]>;
@@ -197,12 +213,11 @@ class TelegramBotAdapter implements ITelegramBotPluginAPIv1, ITelegramBotPluginA
 		return file && typeof file.download === 'function';
 	}
 
-	constructor(app: App, bot: Bot, get_chat_id: () => string, vault_path: string, download_path: string) {
+	constructor(app: App, bot: Bot, get_chat_id: () => string, download_path: string) {
 		console.log("TelegramBotAdapter:constructor")
 		this._app = app;
 		this._bot = bot;
 		this._get_chat_id = get_chat_id;
-		this._vault_path = vault_path;
 		this._download_path = download_path;
 		this._command_handlers = new Map();
 		this._text_handlers = [];
@@ -464,10 +479,7 @@ class TelegramBotAdapter implements ITelegramBotPluginAPIv1, ITelegramBotPluginA
 		text: string,
 		options?: SendMessageOptions,
 	): Promise<SentTelegramMessageRef> {
-		const chatId = this.getAuthorizedChatId();
-		if (!chatId) {
-			throw new Error("Authorized chat is not configured.");
-		}
+		const chatId = this.getAuthorizedChatIdOrThrow();
 
 		const message = await this._bot.api.sendMessage(chatId, this.esc(text), {
 			parse_mode: 'MarkdownV2',
@@ -476,15 +488,235 @@ class TelegramBotAdapter implements ITelegramBotPluginAPIv1, ITelegramBotPluginA
 		return { messageId: message.message_id };
 	}
 
+	async sendDocument(
+		file: TelegramOutboundFile,
+		options?: SendDocumentOptions,
+	): Promise<SentTelegramMessageRef> {
+		return this.sendOutboundMedia(
+			'sendDocument',
+			'document',
+			file,
+			options?.fileName,
+			this.buildOutboundMediaFields(
+				options?.caption,
+				options?.inlineKeyboard,
+				{
+					disable_content_type_detection: options?.disableContentTypeDetection,
+				},
+			),
+		);
+	}
+
+	async sendFile(
+		file: TelegramOutboundFile,
+		options?: SendFileOptions,
+	): Promise<SentTelegramMessageRef> {
+		return this.sendDocument(file, options);
+	}
+
+	async sendPhoto(
+		file: TelegramOutboundFile,
+		options?: SendPhotoOptions,
+	): Promise<SentTelegramMessageRef> {
+		try {
+			return this.sendOutboundMedia(
+				'sendPhoto',
+				'photo',
+				file,
+				options?.fileName,
+				this.buildOutboundMediaFields(
+					options?.caption,
+					options?.inlineKeyboard,
+					{
+						has_spoiler: options?.hasSpoiler,
+					},
+				),
+			);
+		} catch (error) {
+			console.warn(
+				`sendPhoto failed for ${this.describeOutboundFile(file, options?.fileName)}. Falling back to sendDocument. Reason: ${this.describeError(error)}`,
+				error,
+			);
+			return this.sendOutboundMedia(
+				'sendDocument',
+				'document',
+				file,
+				options?.fileName,
+				this.buildOutboundMediaFields(
+					options?.caption,
+					options?.inlineKeyboard,
+				),
+			);
+		}
+	}
+
+	async sendAudio(
+		file: TelegramOutboundFile,
+		options?: SendAudioOptions,
+	): Promise<SentTelegramMessageRef> {
+		return this.sendOutboundMedia(
+			'sendAudio',
+			'audio',
+			file,
+			options?.fileName,
+			this.buildOutboundMediaFields(
+				options?.caption,
+				options?.inlineKeyboard,
+				{
+					duration: options?.duration,
+					performer: options?.performer,
+					title: options?.title,
+				},
+			),
+		);
+	}
+
+	async sendVideo(
+		file: TelegramOutboundFile,
+		options?: SendVideoOptions,
+	): Promise<SentTelegramMessageRef> {
+		return this.sendOutboundMedia(
+			'sendVideo',
+			'video',
+			file,
+			options?.fileName,
+			this.buildOutboundMediaFields(
+				options?.caption,
+				options?.inlineKeyboard,
+				{
+					duration: options?.duration,
+					width: options?.width,
+					height: options?.height,
+					supports_streaming: options?.supportsStreaming,
+					has_spoiler: options?.hasSpoiler,
+				},
+			),
+		);
+	}
+
+	async sendAnimation(
+		file: TelegramOutboundFile,
+		options?: SendAnimationOptions,
+	): Promise<SentTelegramMessageRef> {
+		return this.sendOutboundMedia(
+			'sendAnimation',
+			'animation',
+			file,
+			options?.fileName,
+			this.buildOutboundMediaFields(
+				options?.caption,
+				options?.inlineKeyboard,
+				{
+					duration: options?.duration,
+					width: options?.width,
+					height: options?.height,
+					has_spoiler: options?.hasSpoiler,
+				},
+			),
+		);
+	}
+
+	async sendVoice(
+		file: TelegramOutboundFile,
+		options?: SendVoiceOptions,
+	): Promise<SentTelegramMessageRef> {
+		return this.sendOutboundMedia(
+			'sendVoice',
+			'voice',
+			file,
+			options?.fileName,
+			this.buildOutboundMediaFields(
+				options?.caption,
+				options?.inlineKeyboard,
+				{
+					duration: options?.duration,
+				},
+			),
+		);
+	}
+
+	async sendVideoNote(
+		file: TelegramOutboundFile,
+		options?: SendVideoNoteOptions,
+	): Promise<SentTelegramMessageRef> {
+		return this.sendOutboundMedia(
+			'sendVideoNote',
+			'video_note',
+			file,
+			options?.fileName,
+			this.buildOutboundMediaFields(
+				undefined,
+				options?.inlineKeyboard,
+				{
+					duration: options?.duration,
+					length: options?.length,
+				},
+			),
+		);
+	}
+
+	async sendMediaGroup(
+		items: TelegramMediaGroupItem[],
+	): Promise<SentTelegramMessageRef[]> {
+		if (items.length < 2 || items.length > 10) {
+			throw new Error("Telegram media groups must contain from 2 to 10 items.");
+		}
+
+		const chatId = this.getAuthorizedChatIdOrThrow();
+		const binaryItems = await Promise.all(
+			items.map(async (item, index) => ({
+				item,
+				fileKey: `file${index}`,
+				binaryFile: await this.createOutboundBinaryFile(item.file, item.fileName),
+			})),
+		);
+
+		const formData = new FormData();
+		formData.append('chat_id', chatId);
+		formData.append(
+			'media',
+			JSON.stringify(binaryItems.map(({ item, fileKey }) => this.buildMediaGroupPayloadItem(item, fileKey))),
+		);
+		for (const { fileKey, binaryFile } of binaryItems) {
+			formData.append(
+				fileKey,
+				new Blob([binaryFile.bytes]),
+				binaryFile.fileName,
+			);
+		}
+
+		const result = await this.callTelegramApiWithFormData<
+			Array<{ message_id: number }>
+		>('sendMediaGroup', formData);
+		return result.map((message) => ({ messageId: message.message_id }));
+	}
+
+	async sendLocation(
+		location: TelegramLocation,
+		options?: SendLocationOptions,
+	): Promise<SentTelegramMessageRef> {
+		const chatId = this.getAuthorizedChatIdOrThrow();
+		const message = await this._bot.api.sendLocation(
+			chatId,
+			location.latitude,
+			location.longitude,
+			{
+				horizontal_accuracy: options?.horizontalAccuracy,
+				live_period: options?.livePeriod,
+				heading: options?.heading,
+				proximity_alert_radius: options?.proximityAlertRadius,
+				reply_markup: this.buildInlineKeyboard(options?.inlineKeyboard),
+			},
+		);
+		return { messageId: message.message_id };
+	}
+
 	async editMessage(
 		messageId: number,
 		text: string,
 		options?: SendMessageOptions,
 	): Promise<void> {
-		const chatId = this.getAuthorizedChatId();
-		if (!chatId) {
-			throw new Error("Authorized chat is not configured.");
-		}
+		const chatId = this.getAuthorizedChatIdOrThrow();
 
 		await this._bot.api.editMessageText(chatId, messageId, this.esc(text), {
 			parse_mode: 'MarkdownV2',
@@ -493,10 +725,7 @@ class TelegramBotAdapter implements ITelegramBotPluginAPIv1, ITelegramBotPluginA
 	}
 
 	async deleteMessage(messageId: number): Promise<void> {
-		const chatId = this.getAuthorizedChatId();
-		if (!chatId) {
-			throw new Error("Authorized chat is not configured.");
-		}
+		const chatId = this.getAuthorizedChatIdOrThrow();
 
 		await this._bot.api.deleteMessage(chatId, messageId);
 	}
@@ -547,6 +776,15 @@ class TelegramBotAdapter implements ITelegramBotPluginAPIv1, ITelegramBotPluginA
 		return this._get_chat_id().trim();
 	}
 
+	private getAuthorizedChatIdOrThrow(): string {
+		const chatId = this.getAuthorizedChatId();
+		if (!chatId) {
+			throw new Error("Authorized chat is not configured.");
+		}
+
+		return chatId;
+	}
+
 	private clearExpiredFocus(): void {
 		if (!this._input_focus?.expiresAt) {
 			return;
@@ -561,20 +799,276 @@ class TelegramBotAdapter implements ITelegramBotPluginAPIv1, ITelegramBotPluginA
 		return this._input_focus;
 	}
 
-	private buildInlineKeyboard(keyboard?: SendMessageOptions['inlineKeyboard']) {
+	private buildInlineKeyboardPayload(keyboard?: SendMessageOptions['inlineKeyboard']) {
 		if (!keyboard || keyboard.length === 0) {
 			return undefined;
 		}
 
+		return {
+			inline_keyboard: keyboard.map((row) =>
+				row.map((button) => ({
+					text: button.text,
+					callback_data: button.callbackData,
+				})),
+			),
+		};
+	}
+
+	private buildInlineKeyboard(keyboard?: SendMessageOptions['inlineKeyboard']) {
+		const payload = this.buildInlineKeyboardPayload(keyboard);
+		if (!payload) {
+			return undefined;
+		}
+
 		const inlineKeyboard = new InlineKeyboard();
-		for (const row of keyboard) {
+		for (const row of payload.inline_keyboard) {
 			for (const button of row) {
-				inlineKeyboard.text(button.text, button.callbackData);
+				inlineKeyboard.text(button.text, button.callback_data);
 			}
 			inlineKeyboard.row();
 		}
 
 		return inlineKeyboard;
+	}
+
+	private buildCaptionPayload(caption?: string): {
+		caption?: string;
+		parse_mode?: 'MarkdownV2';
+	} {
+		if (!caption) {
+			return {};
+		}
+
+		return {
+			caption: this.esc(caption),
+			parse_mode: 'MarkdownV2',
+		};
+	}
+
+	private buildOutboundMediaFields(
+		caption?: string,
+		inlineKeyboard?: SendMessageOptions['inlineKeyboard'],
+		extraFields: Record<string, unknown> = {},
+	): Record<string, unknown> {
+		return {
+			...this.buildCaptionPayload(caption),
+			...extraFields,
+			reply_markup: this.buildInlineKeyboardPayload(inlineKeyboard),
+		};
+	}
+
+	private async createOutboundBinaryFile(
+		file: TelegramOutboundFile,
+		fileName?: string,
+	): Promise<OutboundBinaryFile> {
+		if (file instanceof TFile) {
+			return this.createVaultBinaryFile(file, fileName);
+		}
+
+		if (typeof file === 'string') {
+			return this.createVaultBinaryFile(this.requireVaultFile(file), fileName);
+		}
+
+		if (file instanceof Uint8Array) {
+			return {
+				bytes: file,
+				fileName: this.resolveOutboundFileName(fileName),
+			};
+		}
+
+		if (file instanceof ArrayBuffer) {
+			return {
+				bytes: new Uint8Array(file),
+				fileName: this.resolveOutboundFileName(fileName),
+			};
+		}
+
+		throw new TypeError("Unsupported outbound file payload.");
+	}
+
+	private async sendOutboundMedia(
+		method: string,
+		fieldName: string,
+		file: TelegramOutboundFile,
+		fileName: string | undefined,
+		fields: Record<string, unknown>,
+	): Promise<SentTelegramMessageRef> {
+		const chatId = this.getAuthorizedChatIdOrThrow();
+		const binaryFile = await this.createOutboundBinaryFile(file, fileName);
+		return this.sendMultipartFileViaFetch(
+			method,
+			fieldName,
+			chatId,
+			binaryFile,
+			fields,
+		);
+	}
+
+	private async createVaultBinaryFile(
+		file: TFile,
+		fileName?: string,
+	): Promise<OutboundBinaryFile> {
+		const bytes = await this._app.vault.readBinary(file);
+		return {
+			bytes: new Uint8Array(bytes),
+			fileName: this.resolveOutboundFileName(fileName, file.name),
+		};
+	}
+
+	private requireVaultFile(pathInVault: string): TFile {
+		const normalizedPath = normalizePath(pathInVault);
+		const existing = this._app.vault.getAbstractFileByPath(normalizedPath);
+		if (!(existing instanceof TFile)) {
+			throw new Error(`Vault file not found: ${normalizedPath}`);
+		}
+
+		return existing;
+	}
+
+	private resolveOutboundFileName(
+		fileName?: string,
+		fallback?: string,
+	): string {
+		const normalized = fileName?.trim();
+		if (normalized) {
+			return normalized;
+		}
+		if (fallback) {
+			return fallback;
+		}
+
+		throw new Error("fileName is required when sending raw binary data.");
+	}
+
+	private describeOutboundFile(
+		file: TelegramOutboundFile,
+		fileName?: string,
+	): string {
+		if (file instanceof TFile) {
+			return file.path;
+		}
+		if (typeof file === 'string') {
+			return file;
+		}
+		return fileName?.trim() || 'raw-binary-file';
+	}
+
+	private async sendMultipartFileViaFetch(
+		method: string,
+		fieldName: string,
+		chatId: string,
+		file: OutboundBinaryFile,
+		fields: Record<string, unknown>,
+	): Promise<SentTelegramMessageRef> {
+		const formData = new FormData();
+		formData.append('chat_id', chatId);
+		formData.append(fieldName, new Blob([file.bytes]), file.fileName);
+		this.appendFormDataFields(formData, fields);
+
+		const result = await this.callTelegramApiWithFormData<{ message_id: number }>(
+			method,
+			formData,
+		);
+		return { messageId: result.message_id };
+	}
+
+	private buildMediaGroupPayloadItem(
+		item: TelegramMediaGroupItem,
+		fileKey: string,
+	): Record<string, unknown> {
+		const captionPayload = this.buildCaptionPayload(item.caption);
+
+		switch (item.type) {
+			case 'photo':
+				return {
+					type: 'photo',
+					media: `attach://${fileKey}`,
+					...captionPayload,
+					has_spoiler: item.hasSpoiler,
+				};
+			case 'audio':
+				return {
+					type: 'audio',
+					media: `attach://${fileKey}`,
+					...captionPayload,
+					duration: item.duration,
+					performer: item.performer,
+					title: item.title,
+				};
+			case 'video':
+				return {
+					type: 'video',
+					media: `attach://${fileKey}`,
+					...captionPayload,
+					duration: item.duration,
+					width: item.width,
+					height: item.height,
+					supports_streaming: item.supportsStreaming,
+					has_spoiler: item.hasSpoiler,
+				};
+			case 'document':
+				return {
+					type: 'document',
+					media: `attach://${fileKey}`,
+					...captionPayload,
+					disable_content_type_detection: item.disableContentTypeDetection,
+				};
+			default:
+				throw new TypeError(`Unsupported media group item type: ${(item as { type: string }).type}`);
+		}
+	}
+
+	private appendFormDataFields(
+		formData: FormData,
+		fields: Record<string, unknown>,
+	): void {
+		for (const [key, value] of Object.entries(fields)) {
+			if (value === undefined || value === null) {
+				continue;
+			}
+
+			if (typeof value === 'string') {
+				formData.append(key, value);
+				continue;
+			}
+
+			if (typeof value === 'number' || typeof value === 'boolean') {
+				formData.append(key, String(value));
+				continue;
+			}
+
+			formData.append(key, JSON.stringify(value));
+		}
+	}
+
+	private async callTelegramApiWithFormData<T>(
+		method: string,
+		formData: FormData,
+	): Promise<T> {
+		const response = await fetch(
+			`https://api.telegram.org/bot${this._bot.token}/${method}`,
+			{
+				method: 'POST',
+				body: formData,
+			},
+		);
+
+		let payload: { ok?: boolean; result?: T; description?: string } | null = null;
+		try {
+			payload = await response.json() as { ok?: boolean; result?: T; description?: string };
+		} catch (error) {
+			throw new Error(
+				`Telegram API ${method} returned non-JSON response: ${this.describeError(error)}`,
+			);
+		}
+
+		if (!response.ok || !payload?.ok || payload.result === undefined) {
+			throw new Error(
+				`Telegram API ${method} failed with HTTP ${response.status}: ${payload?.description ?? 'Unknown error'}`,
+			);
+		}
+
+		return payload.result;
 	}
 
 	private async replyFromUnit(ctx: Context, unit: string, answer: string): Promise<void> {
@@ -1173,7 +1667,6 @@ export default class TelegramBotPlugin extends Plugin {
 			this.app,
 			this._bot,
 			() => this.settings.chatId,
-			adapter.getBasePath(),
 			this.settings.downloadPath,
 		);
 		this._bot.start();

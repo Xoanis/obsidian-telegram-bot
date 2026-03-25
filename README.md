@@ -12,6 +12,7 @@ This plugin provides a unified API that allows other Obsidian plugins to communi
 - 🚀 **Single entry point** for all Telegram-connected plugins
 - 📁 **Automatic downloading** of files from Telegram to Obsidian vault
 - 💬 **Support** for text messages, commands, and files
+- 📤 **Outgoing media delivery** from other plugins to Telegram users
 
 ## Installation
 
@@ -62,6 +63,22 @@ if (telegramAPI) {
 
   // Send messages
   telegramAPI.sendMessage("Notification from my plugin!");
+
+  // Send a vault document
+  const report = app.vault.getAbstractFileByPath("Exports/report.pdf");
+  if (report instanceof TFile) {
+    await telegramAPI.sendDocument(report, {
+      caption: "Latest report",
+    });
+  }
+
+  // Send a photo
+  const photo = app.vault.getAbstractFileByPath("Assets/cover.jpg");
+  if (photo instanceof TFile) {
+    await telegramAPI.sendPhoto(photo, {
+      caption: "New cover",
+    });
+  }
 }
 ```
 
@@ -91,6 +108,39 @@ interface ITelegramBotPluginAPIv1 {
   
   // Send message to Telegram
   sendMessage(text: string): Promise<void>;
+
+  // Send document from vault path, TFile, or raw bytes
+  sendDocument(
+    file: TFile | string | ArrayBuffer | Uint8Array,
+    options?: {
+      caption?: string;
+      fileName?: string;
+      disableContentTypeDetection?: boolean;
+      inlineKeyboard?: TelegramInlineKeyboard;
+    }
+  ): Promise<void>;
+
+  // Backward-compatible alias for sendDocument
+  sendFile(
+    file: TFile | string | ArrayBuffer | Uint8Array,
+    options?: {
+      caption?: string;
+      fileName?: string;
+      inlineKeyboard?: TelegramInlineKeyboard;
+    }
+  ): Promise<void>;
+
+  sendPhoto(file: TFile | string | ArrayBuffer | Uint8Array, options?: SendPhotoOptions): Promise<void>;
+  sendAudio(file: TFile | string | ArrayBuffer | Uint8Array, options?: SendAudioOptions): Promise<void>;
+  sendVideo(file: TFile | string | ArrayBuffer | Uint8Array, options?: SendVideoOptions): Promise<void>;
+  sendAnimation(file: TFile | string | ArrayBuffer | Uint8Array, options?: SendAnimationOptions): Promise<void>;
+  sendVoice(file: TFile | string | ArrayBuffer | Uint8Array, options?: SendVoiceOptions): Promise<void>;
+  sendVideoNote(file: TFile | string | ArrayBuffer | Uint8Array, options?: SendVideoNoteOptions): Promise<void>;
+  sendMediaGroup(items: TelegramMediaGroupItem[]): Promise<SentTelegramMessageRef[]>;
+  sendLocation(
+    location: { latitude: number; longitude: number },
+    options?: SendLocationOptions
+  ): Promise<void>;
 }
 ```
 
@@ -125,6 +175,25 @@ interface ITelegramBotPluginAPIv2 {
   ): Promise<TFile>;
 
   sendMessage(text: string): Promise<void>;
+  sendDocument(
+    file: TFile | string | ArrayBuffer | Uint8Array,
+    options?: SendDocumentOptions
+  ): Promise<void>;
+  sendFile(
+    file: TFile | string | ArrayBuffer | Uint8Array,
+    options?: SendDocumentOptions
+  ): Promise<void>;
+  sendPhoto(file: TFile | string | ArrayBuffer | Uint8Array, options?: SendPhotoOptions): Promise<void>;
+  sendAudio(file: TFile | string | ArrayBuffer | Uint8Array, options?: SendAudioOptions): Promise<void>;
+  sendVideo(file: TFile | string | ArrayBuffer | Uint8Array, options?: SendVideoOptions): Promise<void>;
+  sendAnimation(file: TFile | string | ArrayBuffer | Uint8Array, options?: SendAnimationOptions): Promise<void>;
+  sendVoice(file: TFile | string | ArrayBuffer | Uint8Array, options?: SendVoiceOptions): Promise<void>;
+  sendVideoNote(file: TFile | string | ArrayBuffer | Uint8Array, options?: SendVideoNoteOptions): Promise<void>;
+  sendMediaGroup(items: TelegramMediaGroupItem[]): Promise<SentTelegramMessageRef[]>;
+  sendLocation(
+    location: { latitude: number; longitude: number },
+    options?: SendLocationOptions
+  ): Promise<void>;
   disposeHandlersForUnit(unitName: string): void;
 }
 ```
@@ -153,6 +222,52 @@ telegramAPI?.registerMessageHandler(async (message, processedBefore) => {
     answer: `Saved ${saved.name}`,
   };
 }, "my-plugin");
+
+const exportFile = app.vault.getAbstractFileByPath("Exports/daily-summary.md");
+if (exportFile instanceof TFile) {
+  await telegramAPI?.sendDocument(exportFile, {
+    caption: "Daily summary export",
+  });
+}
+```
+
+Supported outbound methods:
+
+- `sendDocument`
+- `sendPhoto`
+- `sendAudio`
+- `sendVideo`
+- `sendAnimation`
+- `sendVoice`
+- `sendVideoNote`
+- `sendMediaGroup`
+- `sendLocation`
+
+Example media group:
+
+```typescript
+await telegramAPI?.sendMediaGroup([
+  {
+    type: "photo",
+    file: "Exports/chart-1.png",
+    caption: "Weekly charts",
+  },
+  {
+    type: "photo",
+    file: "Exports/chart-2.png",
+  },
+]);
+```
+
+Example location:
+
+```typescript
+await telegramAPI?.sendLocation(
+  { latitude: 55.751244, longitude: 37.618423 },
+  {
+    inlineKeyboard: [[{ text: "Open dashboard", callbackData: "dashboard" }]],
+  },
+);
 ```
 
 ## Usage Examples
