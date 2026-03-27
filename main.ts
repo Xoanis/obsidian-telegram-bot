@@ -5,6 +5,7 @@ import { type FileFlavor, hydrateFiles } from "@grammyjs/files";
 
 import * as path from 'path';
 import * as fs from 'fs';
+import { escapeTelegramMarkdownV2 } from './src/utils/telegram-markdown.js';
 import {
 	ITelegramBotPluginAPIv1,
 	ITelegramBotPluginAPIv2,
@@ -162,7 +163,7 @@ class TelegramBotAdapter implements ITelegramBotPluginAPIv1, ITelegramBotPluginA
 	private _input_focus: StoredFocusState | null;
 
 	private esc(text: string): string {
-		return text.replace(/[_[\]()~`>#+\-=|{}.!]/g, '\\$&');
+		return escapeTelegramMarkdownV2(text);
 	}
 
 	private getFileMimeType(msg: Message): string | undefined {
