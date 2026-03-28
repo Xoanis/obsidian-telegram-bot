@@ -1,12 +1,14 @@
 {
-	"name": "obsidian-sample-plugin",
+	"name": "obsidian-telegram-bot-plugin",
 	"version": "1.0.0",
-	"description": "This is a sample plugin for Obsidian (https://obsidian.md)",
+	"description": "Telegram transport plugin for Obsidian and PARA-integrated workflows.",
 	"main": "main.js",
 	"scripts": {
 		"dev": "node esbuild.config.mjs",
-		"build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
+		"check": "tsc -noEmit -skipLibCheck",
+		"build": "npm run check && node esbuild.config.mjs production",
 		"test": "node tests/run-tests.mjs",
+		"release:check": "node scripts/validate-release.mjs",
 		"version": "node version-bump.mjs && git add manifest.json versions.json"
 	},
 	"keywords": [],
