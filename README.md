@@ -10,8 +10,8 @@ This plugin provides a unified API that allows other Obsidian plugins to communi
 ## Features
 
 - 🚀 **Single entry point** for all Telegram-connected plugins
-- 📁 **Automatic downloading** of files from Telegram to Obsidian vault
-- 💬 **Support** for text messages, commands, and files
+- 📁 **Controlled file persistence** through `saveFileToVault`
+- 💬 **Unified inbound message model** for commands, text, callbacks, and files
 - 📤 **Outgoing media delivery** from other plugins to Telegram users
 
 ## Installation
@@ -26,43 +26,44 @@ This plugin provides a unified API that allows other Obsidian plugins to communi
 1. Get a bot token from [@BotFather](https://t.me/BotFather)
 2. Open plugin settings in Obsidian
 3. Enter your bot token
-4. Specify download path for files (default: vault root)
-5. Save settings
-6. Send `/start` command to your bot in Telegram
+4. Save settings
+5. Send `/start` command to your bot in Telegram
 
 ## For Plugin Developers
 
-Integrate Telegram capabilities into your plugin using our API:
+Integrate Telegram capabilities into your plugin through the shared Telegram API:
 
 ```typescript
-// Get API instance
-const telegramAPI = app.plugins.plugins['obsidian-telegram-bot-plugin']?.getAPIv1();
+const telegramAPI = app.plugins.plugins['obsidian-telegram-bot-plugin']?.getAPI?.();
 
 if (telegramAPI) {
-  // Register command handler
-  telegramAPI.addCommandHandler("mycmd", async (processedBefore) => {
-    if (processedBefore) return { processed: false, answer: null };
-    return { processed: true, answer: "Command processed!" };
-  }, "my-plugin");
+  telegramAPI.registerMessageHandler(async (message, processedBefore) => {
+    if (processedBefore) {
+      return { processed: false, answer: null };
+    }
 
-  // Register text handler
-  telegramAPI.addTextHandler(async (text, processedBefore) => {
-    if (text.includes("hello") && !processedBefore) {
+    if (message.command?.name === "mycmd") {
+      return { processed: true, answer: "Command processed!" };
+    }
+
+    if (message.text?.includes("hello")) {
       return { processed: true, answer: "Hi there!" };
     }
+
+    if (message.files[0]?.mimeType === "application/pdf") {
+      const saved = await telegramAPI.saveFileToVault(message.files[0], {
+        folder: "Attachments",
+        conflictStrategy: "rename",
+      });
+
+      return { processed: true, answer: `Saved ${saved.name}` };
+    }
+
     return { processed: false, answer: null };
   }, "my-plugin");
 
-  // Register file handler
-  telegramAPI.addFileHandler(async (file, processedBefore, caption) => {
-    if (file.extension === "pdf" && !processedBefore) {
-      return { processed: true, answer: "PDF processed!" };
-    }
-    return { processed: false, answer: null };
-  }, "my-plugin", "application/pdf");
-
   // Send messages
-  telegramAPI.sendMessage("Notification from my plugin!");
+  await telegramAPI.sendMessage("Notification from my plugin!");
 
   // Send a vault document
   const report = app.vault.getAbstractFileByPath("Exports/report.pdf");
@@ -85,78 +86,7 @@ if (telegramAPI) {
 ### Available API Methods
 
 ```typescript
-interface ITelegramBotPluginAPIv1 {
-  // Register command handler
-  addCommandHandler(
-    cmd: string, 
-    handler: (processedBefore: boolean) => Promise<HandlerResult>,
-    unitName: string
-  ): void;
-  
-  // Register text message handler
-  addTextHandler(
-    handler: (text: string, processedBefore: boolean) => Promise<HandlerResult>,
-    unitName: string
-  ): void;
-  
-  // Register file handler
-  addFileHandler(
-    handler: (file: TFile, processedBefore: boolean, caption?: string) => Promise<HandlerResult>,
-    unitName: string,
-    mimeType?: string
-  ): void;
-  
-  // Send message to Telegram
-  sendMessage(text: string): Promise<void>;
-
-  // Send document from vault path, TFile, or raw bytes
-  sendDocument(
-    file: TFile | string | ArrayBuffer | Uint8Array,
-    options?: {
-      caption?: string;
-      fileName?: string;
-      disableContentTypeDetection?: boolean;
-      inlineKeyboard?: TelegramInlineKeyboard;
-    }
-  ): Promise<void>;
-
-  // Backward-compatible alias for sendDocument
-  sendFile(
-    file: TFile | string | ArrayBuffer | Uint8Array,
-    options?: {
-      caption?: string;
-      fileName?: string;
-      inlineKeyboard?: TelegramInlineKeyboard;
-    }
-  ): Promise<void>;
-
-  sendPhoto(file: TFile | string | ArrayBuffer | Uint8Array, options?: SendPhotoOptions): Promise<void>;
-  sendAudio(file: TFile | string | ArrayBuffer | Uint8Array, options?: SendAudioOptions): Promise<void>;
-  sendVideo(file: TFile | string | ArrayBuffer | Uint8Array, options?: SendVideoOptions): Promise<void>;
-  sendAnimation(file: TFile | string | ArrayBuffer | Uint8Array, options?: SendAnimationOptions): Promise<void>;
-  sendVoice(file: TFile | string | ArrayBuffer | Uint8Array, options?: SendVoiceOptions): Promise<void>;
-  sendVideoNote(file: TFile | string | ArrayBuffer | Uint8Array, options?: SendVideoNoteOptions): Promise<void>;
-  sendMediaGroup(items: TelegramMediaGroupItem[]): Promise<SentTelegramMessageRef[]>;
-  sendLocation(
-    location: { latitude: number; longitude: number },
-    options?: SendLocationOptions
-  ): Promise<void>;
-}
-```
-
-### API v2
-
-`ITelegramBotPluginAPIv2` adds a transport-oriented message model for plugins that need more control over Telegram payloads, especially files.
-
-Highlights:
-
-- one normalized message handler for commands, text, and files
-- file descriptors are passed before anything is saved into the vault
-- plugin decides where to persist the file
-- `v1` remains available for backward compatibility
-
-```typescript
-interface ITelegramBotPluginAPIv2 {
+interface ITelegramBotPluginAPI {
   registerMessageHandler(
     handler: (
       message: TelegramMessageContext,
@@ -174,34 +104,65 @@ interface ITelegramBotPluginAPIv2 {
     }
   ): Promise<TFile>;
 
-  sendMessage(text: string): Promise<void>;
+  registerCallbackHandler(
+    handler: (
+      callback: TelegramCallbackContext,
+      processedBefore: boolean
+    ) => Promise<HandlerResult>,
+    unitName: string
+  ): void;
+
+  registerFocusedInputHandler(
+    handler: (
+      message: TelegramMessageContext,
+      focus: InputFocusState
+    ) => Promise<HandlerResult>,
+    unitName: string
+  ): void;
+
+  setInputFocus(unitName: string, options?: SetInputFocusOptions): Promise<void>;
+  clearInputFocus(unitName?: string): Promise<void>;
+  getInputFocus(): Promise<InputFocusState | null>;
+
+  sendMessage(text: string, options?: SendMessageOptions): Promise<SentTelegramMessageRef>;
   sendDocument(
     file: TFile | string | ArrayBuffer | Uint8Array,
     options?: SendDocumentOptions
-  ): Promise<void>;
+  ): Promise<SentTelegramMessageRef>;
   sendFile(
     file: TFile | string | ArrayBuffer | Uint8Array,
     options?: SendDocumentOptions
-  ): Promise<void>;
-  sendPhoto(file: TFile | string | ArrayBuffer | Uint8Array, options?: SendPhotoOptions): Promise<void>;
-  sendAudio(file: TFile | string | ArrayBuffer | Uint8Array, options?: SendAudioOptions): Promise<void>;
-  sendVideo(file: TFile | string | ArrayBuffer | Uint8Array, options?: SendVideoOptions): Promise<void>;
-  sendAnimation(file: TFile | string | ArrayBuffer | Uint8Array, options?: SendAnimationOptions): Promise<void>;
-  sendVoice(file: TFile | string | ArrayBuffer | Uint8Array, options?: SendVoiceOptions): Promise<void>;
-  sendVideoNote(file: TFile | string | ArrayBuffer | Uint8Array, options?: SendVideoNoteOptions): Promise<void>;
+  ): Promise<SentTelegramMessageRef>;
+  sendPhoto(file: TFile | string | ArrayBuffer | Uint8Array, options?: SendPhotoOptions): Promise<SentTelegramMessageRef>;
+  sendAudio(file: TFile | string | ArrayBuffer | Uint8Array, options?: SendAudioOptions): Promise<SentTelegramMessageRef>;
+  sendVideo(file: TFile | string | ArrayBuffer | Uint8Array, options?: SendVideoOptions): Promise<SentTelegramMessageRef>;
+  sendAnimation(file: TFile | string | ArrayBuffer | Uint8Array, options?: SendAnimationOptions): Promise<SentTelegramMessageRef>;
+  sendVoice(file: TFile | string | ArrayBuffer | Uint8Array, options?: SendVoiceOptions): Promise<SentTelegramMessageRef>;
+  sendVideoNote(file: TFile | string | ArrayBuffer | Uint8Array, options?: SendVideoNoteOptions): Promise<SentTelegramMessageRef>;
   sendMediaGroup(items: TelegramMediaGroupItem[]): Promise<SentTelegramMessageRef[]>;
   sendLocation(
     location: { latitude: number; longitude: number },
     options?: SendLocationOptions
-  ): Promise<void>;
+  ): Promise<SentTelegramMessageRef>;
+  editMessage(messageId: number, text: string, options?: SendMessageOptions): Promise<void>;
+  deleteMessage(messageId: number): Promise<void>;
+  answerCallbackQuery(callbackId: string, text?: string): Promise<void>;
+  encodeCallbackPayload(payload: TelegramCallbackPayload): string;
+  decodeCallbackPayload(data: string): TelegramCallbackPayload | null;
   disposeHandlersForUnit(unitName: string): void;
 }
 ```
 
+The key idea is simple:
+
+- one normalized message handler for commands, text, and files
+- files arrive as descriptors before anything is saved to the vault
+- the consumer plugin decides whether and where to persist the file
+
 Example:
 
 ```typescript
-const telegramAPI = app.plugins.plugins['obsidian-telegram-bot-plugin']?.getAPIv2?.();
+const telegramAPI = app.plugins.plugins['obsidian-telegram-bot-plugin']?.getAPI?.();
 
 telegramAPI?.registerMessageHandler(async (message, processedBefore) => {
   if (processedBefore) {
@@ -274,24 +235,34 @@ await telegramAPI?.sendLocation(
 
 ### Voice Message Transcription Plugin
 ```typescript
-telegramAPI.addFileHandler(async (file, processed, caption) => {
-  if (file.extension === "ogg" && !processed) {
+telegramAPI?.registerMessageHandler(async (message, processed) => {
+  if (processed || message.kind !== "voice" || message.files.length === 0) {
+    return { processed: false, answer: null };
+  }
+
+  const file = await telegramAPI.saveFileToVault(message.files[0], {
+    folder: "Voice Notes",
+    conflictStrategy: "rename",
+  });
+
+  if (file.extension === "ogg") {
     const transcript = await transcribeAudio(file);
     await createNote(transcript);
     return { processed: true, answer: "Voice message transcribed!" };
   }
+
   return { processed: false, answer: null };
-}, "voice-notes", "audio/ogg");
+}, "voice-notes");
 ```
 
 ### Notification Plugin
 ```typescript
-telegramAPI.addCommandHandler("remind", async (processed) => {
-  if (processed) return { processed: false, answer: null };
-  
-  // Reminder creation logic
-  await createReminder();
-  
+telegramAPI?.registerMessageHandler(async (message, processed) => {
+  if (processed || message.command?.name !== "remind") {
+    return { processed: false, answer: null };
+  }
+
+  await createReminder(message.command.args);
   return { processed: true, answer: "Reminder set!" };
 }, "reminder-plugin");
 ```

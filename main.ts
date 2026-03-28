@@ -7,12 +7,8 @@ import * as path from 'path';
 import * as fs from 'fs';
 import { escapeTelegramMarkdownV2 } from './src/utils/telegram-markdown.js';
 import {
-	ITelegramBotPluginAPIv1,
-	ITelegramBotPluginAPIv2,
-	CommandHandler,
+	ITelegramBotPluginAPI,
 	HandlerResult,
-	TextHandler,
-	FileHandler,
 	TelegramMessageContext,
 	TelegramMessageHandler,
 	TelegramFileDescriptor,
@@ -38,8 +34,6 @@ import {
 	SentTelegramMessageRef,
 	TelegramOutboundFile,
 } from './telegram_plugin_api';
-
-const moment = window.moment;
 
 export interface FileX {
     /** Computes a URL from the `file_path` property of this file object. The
@@ -107,32 +101,6 @@ type GrammyFile = File & FileX;
 interface TelegramBotPluginSettings {
 	botToken: string;
 	chatId: string;
-	downloadPath: string;
-}
-
-interface LegacyCommandEnvelope {
-	type: 'command';
-	command: string;
-	args: string;
-}
-
-interface LegacyTextEnvelope {
-	type: 'text';
-	text: string;
-}
-
-interface LegacyFileEnvelope {
-	type: 'file';
-	mimeType: string;
-	caption?: string;
-	getFile: () => Promise<TFile>;
-}
-
-type LegacyEnvelope = LegacyCommandEnvelope | LegacyTextEnvelope | LegacyFileEnvelope;
-
-interface TelegramEventEnvelope {
-	message: TelegramMessageContext;
-	legacy?: LegacyEnvelope;
 }
 
 interface StoredFocusState extends InputFocusState {
@@ -146,17 +114,12 @@ interface OutboundBinaryFile {
 const DEFAULT_SETTINGS: TelegramBotPluginSettings = {
 	botToken: '',
 	chatId: '',
-	downloadPath: '',
 }
 
-class TelegramBotAdapter implements ITelegramBotPluginAPIv1, ITelegramBotPluginAPIv2 {
+class TelegramBotAdapter implements ITelegramBotPluginAPI {
 	private _app: App;
 	private _bot: Bot;
-	private readonly _download_path: string;
 	private readonly _get_chat_id: () => string;
-	private _command_handlers: Map<string,{ handler: CommandHandler, unit: string }[]>;
-	private _text_handlers: { handler: TextHandler, unit: string }[];
-	private _file_handlers: Map<string, { handler: FileHandler, unit: string}[]>;
 	private _message_handlers: { handler: TelegramMessageHandler, unit: string }[];
 	private _callback_handlers: { handler: TelegramCallbackHandler, unit: string }[];
 	private _focused_input_handlers: { handler: TelegramFocusedInputHandler, unit: string }[];
@@ -186,43 +149,15 @@ class TelegramBotAdapter implements ITelegramBotPluginAPIv1, ITelegramBotPluginA
 		}		
 	}
 
-	private mimeTypeMatches(pattern: string, mimeType: string): boolean {
-		if (pattern === mimeType) {
-			return true;
-		}
-
-		const [patternType, patternSubType] = pattern.split('/');
-		const [type, subType] = mimeType.split('/');
-
-		if (!patternType || !patternSubType || !type || !subType) {
-			return false;
-		}
-
-		// Support both "type/*" and "*/*" wildcard patterns.
-		if (patternType === '*' && patternSubType === '*') {
-			return true;
-		}
-
-		if (patternType === type && patternSubType === '*') {
-			return true;
-		}
-
-		return false;
-	}
-
 	private isGrammyFile(file: any): file is GrammyFile {
 		return file && typeof file.download === 'function';
 	}
 
-	constructor(app: App, bot: Bot, get_chat_id: () => string, download_path: string) {
+	constructor(app: App, bot: Bot, get_chat_id: () => string) {
 		console.log("TelegramBotAdapter:constructor")
 		this._app = app;
 		this._bot = bot;
 		this._get_chat_id = get_chat_id;
-		this._download_path = download_path;
-		this._command_handlers = new Map();
-		this._text_handlers = [];
-		this._file_handlers = new Map();
 		this._message_handlers = [];
 		this._callback_handlers = [];
 		this._focused_input_handlers = [];
@@ -245,14 +180,11 @@ class TelegramBotAdapter implements ITelegramBotPluginAPIv1, ITelegramBotPluginA
 					return;
 				} 
 
-				await this.dispatchEnvelope(ctx, {
-					message: this.toCommandMessageContext(ctx, cmd, args),
-					legacy: {
-						type: 'command',
-						command: cmd,
-						args: args,
-					},
-				});
+				await this.dispatchMessageHandlers(
+					ctx,
+					this.toCommandMessageContext(ctx, cmd, args),
+					false,
+				);
 
 			} catch (error) {
 				console.error(`Unexpected error: ${error}`)
@@ -296,21 +228,7 @@ class TelegramBotAdapter implements ITelegramBotPluginAPIv1, ITelegramBotPluginA
 						return;
 					}
 				}
-				let legacyFilePromise: Promise<TFile> | null = null;
-				await this.dispatchEnvelope(ctx, {
-					message: fileMessage,
-					legacy: {
-						type: 'file',
-						mimeType: mime_type,
-						caption: caption,
-						getFile: async () => {
-							if (!legacyFilePromise) {
-								legacyFilePromise = this.downloadLegacyFile(descriptor);
-							}
-							return legacyFilePromise;
-						},
-					},
-				});
+				await this.dispatchMessageHandlers(ctx, fileMessage, false);
 
 			} catch (error) {
 				console.error(`Unexpected error: ${error}`)
@@ -343,13 +261,11 @@ class TelegramBotAdapter implements ITelegramBotPluginAPIv1, ITelegramBotPluginA
 						return;
 					}
 				}
-				await this.dispatchEnvelope(ctx, {
-					message: this.toTextMessageContext(ctx, text),
-					legacy: {
-						type: 'text',
-						text: text,
-					},
-				});
+				await this.dispatchMessageHandlers(
+					ctx,
+					this.toTextMessageContext(ctx, text),
+					false,
+				);
 			} catch (error) {
 				console.error(`Unexpected error: ${error}`)
 				await ctx.reply('❌ Internal error');
@@ -384,35 +300,6 @@ class TelegramBotAdapter implements ITelegramBotPluginAPIv1, ITelegramBotPluginA
 		});
 	}
 	
-	addCommandHandler(cmd: string, handler: CommandHandler, unit_name: string): void {
-		const item_to_add = {handler: handler, unit: unit_name};
-		if (this._command_handlers.has(cmd)) {
-			this._command_handlers.get(cmd)?.push(item_to_add);
-			return;
-		}
-		this._command_handlers.set(cmd, [ item_to_add ]);		
-	}
-
-	addTextHandler(handler: TextHandler, unit_name: string): void {
-		this._text_handlers.push({handler: handler, unit: unit_name});		
-	}
-
-	addFileHandler(handler: FileHandler, unit_name: string, mime_type?: string): void {
-		const item_to_add = {handler: handler, unit: unit_name};
-
-		if (!mime_type) {
-			mime_type = '';
-		}
-
-		if (this._file_handlers.has(mime_type)) {
-			this._file_handlers.get(mime_type)?.push(item_to_add);
-			return;
-		}
-		this._file_handlers.set(mime_type, [ item_to_add ]);
-
-		console.log(this._file_handlers)
-	}
-
 	registerMessageHandler(handler: TelegramMessageHandler, unit_name: string): void {
 		this._message_handlers.push({ handler: handler, unit: unit_name });
 	}
@@ -753,13 +640,6 @@ class TelegramBotAdapter implements ITelegramBotPluginAPIv1, ITelegramBotPluginA
 
 	disposeHandlersForUnit(unit_name: string): void {
 		console.log(`Disposing handlers for unit ${unit_name}`)
-		for (const [cmd, handlers] of this._command_handlers.entries()) {
-			this._command_handlers.set(cmd, handlers.filter(h => h.unit !== unit_name));
-		}
-		this._text_handlers = this._text_handlers.filter(h => h.unit !== unit_name);
-		for (const [mime, handlers] of this._file_handlers.entries()) {
-			this._file_handlers.set(mime, handlers.filter(h => h.unit !== unit_name));
-		}
 		this._message_handlers = this._message_handlers.filter(h => h.unit !== unit_name);
 		this._callback_handlers = this._callback_handlers.filter(h => h.unit !== unit_name);
 		this._focused_input_handlers = this._focused_input_handlers.filter(h => h.unit !== unit_name);
@@ -1078,32 +958,6 @@ class TelegramBotAdapter implements ITelegramBotPluginAPIv1, ITelegramBotPluginA
 		});
 	}
 
-	private async dispatchEnvelope(
-		ctx: Context,
-		envelope: TelegramEventEnvelope,
-	): Promise<boolean> {
-		if (envelope.legacy?.type === 'file') {
-			const processedByLegacy = await this.dispatchLegacyHandlers(ctx, envelope.legacy, false);
-			return this.dispatchMessageHandlers(
-				ctx,
-				envelope.message,
-				processedByLegacy,
-			);
-		}
-
-		let processed_before = await this.dispatchMessageHandlers(
-			ctx,
-			envelope.message,
-			false,
-		);
-
-		if (!envelope.legacy) {
-			return processed_before;
-		}
-
-		return this.dispatchLegacyHandlers(ctx, envelope.legacy, processed_before);
-	}
-
 	private async dispatchFocusedInputHandlers(
 		ctx: Context,
 		message: TelegramMessageContext,
@@ -1162,155 +1016,6 @@ class TelegramBotAdapter implements ITelegramBotPluginAPIv1, ITelegramBotPluginA
 
 		if (!processed_before && callback.callbackId) {
 			await this.answerCallbackQuery(callback.callbackId);
-		}
-
-		return processed_before;
-	}
-
-	private async dispatchLegacyHandlers(
-		ctx: Context,
-		legacy: LegacyEnvelope,
-		processed_before: boolean,
-	): Promise<boolean> {
-		if (legacy.type === 'command') {
-			return this.dispatchLegacyCommandHandlers(
-				ctx,
-				legacy.command,
-				legacy.args,
-				processed_before,
-			);
-		}
-
-		if (legacy.type === 'text') {
-			return this.dispatchLegacyTextHandlers(ctx, legacy.text, processed_before);
-		}
-
-		return this.dispatchLegacyFileHandlers(
-			ctx,
-			legacy.mimeType,
-			legacy.getFile,
-			legacy.caption,
-			processed_before,
-		);
-	}
-
-	private async dispatchLegacyCommandHandlers(
-		ctx: Context,
-		command: string,
-		args: string,
-		processed_before: boolean,
-	): Promise<boolean> {
-		const items = this._command_handlers.get(command);
-		if (!items || items.length === 0) {
-			console.log(`There are no handlers for command ${command}`);
-			return processed_before;
-		}
-
-		for (let i = 0; i < items.length; i++) {
-			const element = items[i];
-			console.log(`Executing handler for command ${command} from unit ${element.unit}`);
-			const reply: HandlerResult = await element.handler(args, processed_before);
-			processed_before = processed_before || reply.processed;
-			if (reply.answer) {
-				await this.replyFromUnit(ctx, element.unit, reply.answer);
-			}
-			console.log(`Finished handler for command ${command} from unit ${element.unit}, processed_before=${processed_before}`);
-		}
-
-		return processed_before;
-	}
-
-	private async dispatchLegacyTextHandlers(
-		ctx: Context,
-		text: string,
-		processed_before: boolean,
-	): Promise<boolean> {
-		if (this._text_handlers.length === 0) {
-			console.log(`There are no handlers for text messages`);
-			return processed_before;
-		}
-
-		for (let i = 0; i < this._text_handlers.length; i++) {
-			const element = this._text_handlers[i];
-			const reply: HandlerResult = await element.handler(text, processed_before);
-			processed_before = processed_before || reply.processed;
-			if (reply.answer) {
-				await this.replyFromUnit(ctx, element.unit, reply.answer);
-			}
-		}
-
-		return processed_before;
-	}
-
-	private async dispatchLegacyFileHandlers(
-		ctx: Context,
-		mimeType: string,
-		getFile: () => Promise<TFile>,
-		caption: string | undefined,
-		processed_before: boolean,
-	): Promise<boolean> {
-		const exact_handlers = this._file_handlers.get(mimeType);
-		const all_files_handlers = this._file_handlers.get('');
-		const wildcard_handlers: { handler: FileHandler; unit: string }[] = [];
-
-		for (const [pattern, handlers] of this._file_handlers.entries()) {
-			if (!pattern || pattern === mimeType) {
-				continue;
-			}
-			if (this.mimeTypeMatches(pattern, mimeType)) {
-				wildcard_handlers.push(...handlers);
-			}
-		}
-
-		if (!exact_handlers && wildcard_handlers.length === 0 && !all_files_handlers) {
-			console.log(`There are no legacy file handlers for file with type ${mimeType}`);
-			return processed_before;
-		}
-
-		const obsidian_file = await getFile();
-		processed_before = await this.executeLegacyFileHandlers(
-			ctx,
-			exact_handlers,
-			obsidian_file,
-			caption,
-			processed_before,
-		);
-		processed_before = await this.executeLegacyFileHandlers(
-			ctx,
-			wildcard_handlers,
-			obsidian_file,
-			caption,
-			processed_before,
-		);
-		processed_before = await this.executeLegacyFileHandlers(
-			ctx,
-			all_files_handlers,
-			obsidian_file,
-			caption,
-			processed_before,
-		);
-
-		return processed_before;
-	}
-
-	private async executeLegacyFileHandlers(
-		ctx: Context,
-		handlers: { handler: FileHandler; unit: string }[] | undefined,
-		obsidian_file: TFile,
-		caption: string | undefined,
-		processed_before: boolean,
-	): Promise<boolean> {
-		if (!handlers || handlers.length === 0) {
-			return processed_before;
-		}
-
-		for (let i = 0; i < handlers.length; i++) {
-			const element = handlers[i];
-			const reply = await element.handler(obsidian_file, processed_before, caption);
-			processed_before = processed_before || reply.processed;
-			if (reply.answer) {
-				await this.replyFromUnit(ctx, element.unit, reply.answer);
-			}
 		}
 
 		return processed_before;
@@ -1457,14 +1162,6 @@ class TelegramBotAdapter implements ITelegramBotPluginAPIv1, ITelegramBotPluginA
 		return extension || fallback;
 	}
 
-	private async downloadLegacyFile(file: TelegramFileDescriptor): Promise<TFile> {
-		return this.saveFileToVault(file, {
-			folder: this._download_path,
-			fileName: `${moment().format('YYYY-MM-DD-HH-mm-ss-')}${file.suggestedName.replace(/[\\/]/g, '-')}`,
-			conflictStrategy: 'rename',
-		});
-	}
-
 	private async ensureVaultFolder(folder: string): Promise<void> {
 		if (!folder) {
 			return;
@@ -1609,11 +1306,7 @@ export default class TelegramBotPlugin extends Plugin {
 	private _bot: Bot;
 	private _api: TelegramBotAdapter;
 
-	public getAPIv1(): ITelegramBotPluginAPIv1 {
-		return this._api;
-	}
-
-	public getAPIv2(): ITelegramBotPluginAPIv2 {
+	public getAPI(): ITelegramBotPluginAPI {
 		return this._api;
 	}
 
@@ -1668,7 +1361,6 @@ export default class TelegramBotPlugin extends Plugin {
 			this.app,
 			this._bot,
 			() => this.settings.chatId,
-			this.settings.downloadPath,
 		);
 		this._bot.start();
 	}
@@ -1715,16 +1407,6 @@ class TelegramBotSettingTab extends PluginSettingTab {
 				.setValue(this.plugin.settings.botToken)
 				.onChange(async (value) => {
 					this.plugin.settings.botToken = value;
-					await this.plugin.saveSettings();
-				}));
-		new Setting(containerEl)
-			.setName('Download files path')
-			.setDesc('Folder where to download files sending from bot users')
-			.addText(text => text
-				.setPlaceholder('some/path/in/your/vault')
-				.setValue(this.plugin.settings.downloadPath)
-				.onChange(async (value) => {
-					this.plugin.settings.downloadPath = value;
 					await this.plugin.saveSettings();
 				}));
 	}
