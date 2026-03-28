@@ -1,6 +1,6 @@
 {
 	"name": "obsidian-telegram-bot-plugin",
-	"version": "1.0.0",
+	"version": "1.0.1",
 	"description": "Telegram transport plugin for Obsidian and PARA-integrated workflows.",
 	"main": "main.js",
 	"scripts": {
@@ -27,6 +27,6 @@
 	"dependencies": {
 		"@grammyjs/files": "^1.1.1",
 		"grammy": "^1.36.3",
-		"obsidian-para-suite-contracts": "github:Xoanis/obsidian-para-suite-contracts#v0.1.0"
+		"obsidian-para-suite-contracts": "git+https://github.com/Xoanis/obsidian-para-suite-contracts.git#v0.1.1"
 	}
 }
